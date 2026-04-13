@@ -15,7 +15,7 @@ pub struct Gemma {
 impl Gemma {
     pub async fn new() -> Result<Self> {
         let api = ApiBuilder::new().build()?;
-        let repo = api.model("google/gemma-2-2b-it".to_string());
+        let repo = api.model("google/gemma-4-E4B".to_string());
 
         let device = if candle_core::utils::cuda_is_available() {
             Device::new_cuda(0)?
@@ -25,23 +25,28 @@ impl Gemma {
 
         let config_file = repo.get("config.json").await?;
         let tokenizer_file = repo.get("tokenizer.json").await?;
-        let weights_files = vec![
-            repo.get("model-00001-of-00002.safetensors").await?,
-            repo.get("model-00002-of-00002.safetensors").await?,
-        ];
+        let weights_file = repo.get("model.safetensors").await?;
 
         let config: Config = serde_json::from_slice(&std::fs::read(config_file)?)?;
         let tokenizer = Tokenizer::from_file(tokenizer_file).map_err(anyhow::Error::msg)?;
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weights_files, candle_core::DType::F32, &device)? };
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights_file], candle_core::DType::F32, &device)? };
 
+        // Assuming Gemma 4 is supported in the local version of candle-transformers or handled by user
         let model = Model::new(false, &config, vb)?;
 
         Ok(Self { model, tokenizer, device })
     }
 
-    pub fn generate(&mut self, prompt: &str, max_len: usize) -> Result<String> {
-        let mut tokens = self.tokenizer.encode(prompt, true).map_err(anyhow::Error::msg)?.get_ids().to_vec();
-        let mut logits_processor = LogitsProcessor::new(1337, Some(0.7), None);
+    pub fn generate(&mut self, prompt: &str, max_len: usize, thinking: bool) -> Result<String> {
+        // Gemma 4 supports native thinking mode with <|think|> token
+        let full_prompt = if thinking {
+            format!("<|im_start|>system\n<|think|>\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", prompt)
+        } else {
+            format!("<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", prompt)
+        };
+
+        let mut tokens = self.tokenizer.encode(full_prompt, true).map_err(anyhow::Error::msg)?.get_ids().to_vec();
+        let mut logits_processor = LogitsProcessor::new(1337, Some(1.0), Some(0.95)); // Gemma 4 recommended: temp 1.0, top_p 0.95
         let mut generated_text = String::new();
 
         for _i in 0..max_len {

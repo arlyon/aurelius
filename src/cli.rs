@@ -5,6 +5,10 @@ use std::path::PathBuf;
 #[command(name = "aurelius")]
 #[command(about = "Rust-Recall: A fully on-device RAG CLI tool.", long_about = None)]
 pub struct Cli {
+    /// Use quantized version of the embedding model.
+    #[arg(long, global = true)]
+    pub quantized: bool,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -25,4 +29,7 @@ pub enum Commands {
         /// The natural language query.
         query: String,
     },
+
+    /// List all ingested files in the database.
+    Ls,
 }

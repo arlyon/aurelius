@@ -5,14 +5,14 @@ use lancedb::connect;
 use lancedb::query::ExecutableQuery;
 use lancedb::query::QueryBase;
 
-pub async fn run_search(query: String) -> Result<()> {
-    let mut embedder = Embedder::new().await?;
+pub async fn run_search(query: String, quantized: bool) -> Result<()> {
+    let embedder = Embedder::new(quantized).await?;
     let mut gemma = Gemma::new().await?;
     let db_path = "aurelius_db";
     let db = connect(db_path).execute().await?;
     let table_name = "chunks";
 
-    let vector = embedder.embed_query(&query)?;
+    let vector = embedder.embed_query(&query).await?;
 
     // Hybrid search: Vector search + BM25
     let table = db.open_table(table_name).execute().await?;
@@ -35,7 +35,7 @@ pub async fn run_search(query: String) -> Result<()> {
         query, context
     );
 
-    let answer = gemma.generate(&prompt, 512)?;
+    let answer = gemma.generate(&prompt, 512, false)?;
     println!("{}", answer);
 
     Ok(())
