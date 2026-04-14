@@ -36,7 +36,3 @@ arrow-schema = "57.3.0"
 ort = { version = "2.0.0-rc.11", features = ["ndarray"] }
 num_cpus = "1.17.0"
 ndarray = "0.17.2"
-
-[[bin]]
-name = "inspect_gguf"
-path = "scripts/inspect_gguf.rs"
