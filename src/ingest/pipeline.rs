@@ -11,12 +11,12 @@ use tracing::{debug, info, warn};
 
 #[derive(Clone, Default, Debug)]
 pub struct GitignoreLoader {
-    path: PathBuf,
+    path: Vec<PathBuf>,
 }
 
 impl GitignoreLoader {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+    pub fn new(path: Vec<PathBuf>) -> Self {
+        Self { path }
     }
 }
 
@@ -25,27 +25,30 @@ impl Loader for GitignoreLoader {
     type Output = String;
 
     fn into_stream(self) -> IndexingStream<Self::Output> {
-        let files = crate::ingest::walker::walk_directory(self.path.clone());
-        info!("Found {} files to process", files.len());
-        let nodes: Vec<Node<String>> = files
+        let nodes = self
+            .path
             .into_iter()
-            .filter_map(|p| {
-                let path_str = p.to_string_lossy().to_string();
-                debug!("Preparing node for {:?}", path_str);
+            .flat_map(|p| {
+                let files = crate::ingest::walker::walk_directory(p);
+                info!("Found {} files to process", files.len());
+                files.into_iter().filter_map(|p| {
+                    let path_str = p.to_string_lossy().to_string();
+                    debug!("Preparing node for {:?}", path_str);
 
-                // Hash the file for caching
-                let hash = match std::fs::read(&p) {
-                    Ok(bytes) => blake3::hash(&bytes).to_hex().to_string(),
-                    Err(e) => {
-                        warn!("Failed to read file for hashing at {:?}: {}", p, e);
-                        return None;
-                    }
-                };
+                    // Hash the file for caching
+                    let hash = match std::fs::read(&p) {
+                        Ok(bytes) => blake3::hash(&bytes).to_hex().to_string(),
+                        Err(e) => {
+                            warn!("Failed to read file for hashing at {:?}: {}", p, e);
+                            return None;
+                        }
+                    };
 
-                let mut node = Node::<String>::new("".to_string());
-                node.metadata.insert("path".to_string(), path_str);
-                node.metadata.insert("hash".to_string(), hash);
-                Some(node)
+                    let mut node = Node::<String>::new("".to_string());
+                    node.metadata.insert("path".to_string(), path_str);
+                    node.metadata.insert("hash".to_string(), hash);
+                    Some(node)
+                })
             })
             .collect();
 
@@ -156,7 +159,7 @@ impl NodeCache for Cache {
     async fn set(&self, _node: &Node<Self::Input>) {}
 }
 
-pub async fn run_ingest(path: PathBuf, quantized: bool) -> Result<()> {
+pub async fn run_ingest(path: Vec<PathBuf>, quantized: bool) -> Result<()> {
     info!("Starting ingestion for {:?}", path);
 
     let embedder = Embedder::new(quantized).await?;
@@ -165,6 +168,8 @@ pub async fn run_ingest(path: PathBuf, quantized: bool) -> Result<()> {
         .uri("aurelius_db")
         .table_name("chunks")
         .vector_size(2560) // zembed-1 dimension
+        .with_vector(indexing::EmbeddedField::Combined)
+        .with_metadata("path")
         .build()?;
 
     let loader = GitignoreLoader::new(path);
@@ -176,7 +181,7 @@ pub async fn run_ingest(path: PathBuf, quantized: bool) -> Result<()> {
         .filter(|node| node.as_ref().map(|n| !n.chunk.is_empty()).unwrap_or(false))
         .then(LogTransformer::default())
         .then_chunk(indexing::transformers::ChunkMarkdown::from_chunk_range(
-            10..512,
+            5..50,
         ))
         .then(ContextPrependTransformer::default())
         .then_in_batch(indexing::transformers::Embed::new(embedder))

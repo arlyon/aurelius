@@ -1,3 +1,5 @@
+#![allow(clippy::default_constructed_unit_structs)]
+
 mod cli;
 mod ingest;
 mod models;
@@ -6,11 +8,11 @@ mod query;
 use anyhow::Result;
 use clap::Parser;
 use cli::{Cli, Commands};
-use models::download::download_models;
 use ingest::pipeline::run_ingest;
-use query::search::run_search;
+use models::download::download_models;
 use query::ls::run_ls;
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use query::search::run_search;
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 #[tokio::main]
 async fn main() -> Result<()> {

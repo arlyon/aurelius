@@ -21,7 +21,7 @@ pub enum Commands {
     /// Ingest a directory of files into the local knowledge graph.
     Ingest {
         /// The path to the directory to ingest.
-        path: PathBuf,
+        path: Vec<PathBuf>,
     },
 
     /// Search the knowledge graph and generate a response.

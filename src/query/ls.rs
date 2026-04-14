@@ -1,9 +1,9 @@
 use anyhow::Result;
-use arrow_array::{Array, StringArray, StructArray};
+use arrow_array::{Array, StringArray};
 use futures::StreamExt;
 use lancedb::connect;
 use lancedb::query::ExecutableQuery;
-use std::collections::HashSet;
+use std::collections::BTreeMap;
 
 pub async fn run_ls() -> Result<()> {
     let db_path = "aurelius_db";
@@ -21,38 +21,49 @@ pub async fn run_ls() -> Result<()> {
         }
     };
 
-    // Select all columns instead of forcing "metadata" to avoid schema errors if empty
     let mut stream = table.query().execute().await?;
 
-    let mut paths = HashSet::new();
+    // Map path to a list of chunks
+    let mut file_contents: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
     while let Some(batch_result) = stream.next().await {
         let batch = batch_result?;
 
-        // LanceDB usually stores metadata as a StructArray.
-        // We'll try to find the "path" field inside the metadata struct.
-        if let Some(metadata_col) = batch.column_by_name("metadata") {
-            if let Some(metadata_struct) = metadata_col.as_any().downcast_ref::<StructArray>() {
-                if let Some(path_col) = metadata_struct.column_by_name("path") {
-                    if let Some(path_array) = path_col.as_any().downcast_ref::<StringArray>() {
-                        for i in 0..path_array.len() {
-                            if !path_array.is_null(i) {
-                                paths.insert(path_array.value(i).to_string());
-                            }
-                        }
-                    }
+        let path_col = batch
+            .column_by_name("path")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let chunk_col = batch
+            .column_by_name("chunk")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+
+        if let (Some(path_array), Some(chunk_array)) = (path_col, chunk_col) {
+            for i in 0..path_array.len() {
+                if !path_array.is_null(i) && !chunk_array.is_null(i) {
+                    let path = path_array.value(i).to_string();
+                    let chunk = chunk_array.value(i).to_string();
+                    file_contents.entry(path).or_default().push(chunk);
                 }
             }
         }
     }
 
-    if paths.is_empty() {
+    if file_contents.is_empty() {
         println!("No files found in the database.");
     } else {
-        let mut sorted_paths: Vec<_> = paths.into_iter().collect();
-        sorted_paths.sort();
-        for path in sorted_paths {
-            println!("{}", path);
+        for (path, chunks) in file_contents {
+            println!("Path: {}", path);
+            println!("Content:");
+            for chunk in chunks {
+                // If the chunk has the "File: ...\n---\n" prefix, we might want to strip it
+                // but for now let's just print it as is or try to strip it if it matches.
+                let display_chunk = if chunk.starts_with(&format!("File: {}\n---\n", path)) {
+                    &chunk[format!("File: {}\n---\n", path).len()..]
+                } else {
+                    &chunk
+                };
+                print!("{}", display_chunk);
+            }
+            println!("\n---");
         }
     }
 
