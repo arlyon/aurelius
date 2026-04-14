@@ -178,11 +178,11 @@ pub async fn run_ingest(path: Vec<PathBuf>, quantized: bool) -> Result<()> {
         .with_concurrency(1)
         .filter_cached(Cache)
         .then(KreuzbergTransformer::default())
-        .filter(|node| node.as_ref().map(|n| !n.chunk.is_empty()).unwrap_or(false))
         .then(LogTransformer::default())
         .then_chunk(indexing::transformers::ChunkMarkdown::from_chunk_range(
-            5..50,
+            100..500,
         ))
+        .filter(|node| node.as_ref().map(|n| !n.chunk.is_empty()).unwrap_or(false))
         .then(ContextPrependTransformer::default())
         .then_in_batch(indexing::transformers::Embed::new(embedder))
         .then_store_with(lancedb)
