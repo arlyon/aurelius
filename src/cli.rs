@@ -9,6 +9,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub quantized: bool,
 
+    /// Use ollama for embeddings.
+    #[arg(long, global = true)]
+    pub ollama: bool,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -22,6 +26,14 @@ pub enum Commands {
     Ingest {
         /// The path to the directory to ingest.
         path: Vec<PathBuf>,
+
+        /// Invalidate cache for paths matching this glob.
+        #[arg(long)]
+        invalidate_path: Option<String>,
+
+        /// Invalidate cache for entries added before this date (RFC3339 or '1h', '2d' offset).
+        #[arg(long)]
+        invalidate_before: Option<String>,
     },
 
     /// Search the knowledge graph and generate a response.

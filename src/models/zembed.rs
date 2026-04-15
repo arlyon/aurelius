@@ -4,9 +4,9 @@ use candle_core::{DType, Device, IndexOp, Tensor};
 use fastembed::{Qwen3Config, Qwen3Model};
 use hf_hub::api::tokio::ApiBuilder;
 use ndarray::{Array2, ArrayViewD};
-use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::session::SessionInputValue;
+use ort::session::builder::GraphOptimizationLevel;
 use ort::value::Value;
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -14,11 +14,12 @@ use swiftide::chat_completion::errors::LanguageModelError;
 use swiftide::traits::EmbeddingModel;
 use tokenizers::Tokenizer;
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{debug, info};
 
 pub enum Model {
     Full(Qwen3Model),
     Quantized(Session),
+    Ollama(swiftide::integrations::ollama::Ollama),
 }
 
 pub struct Embedder {
@@ -55,7 +56,7 @@ fn build_attention_mask_4d(mask: &Tensor) -> candle_core::Result<Tensor> {
 }
 
 impl Embedder {
-    pub async fn new(quantized: bool) -> Result<Self> {
+    pub async fn new(quantized: bool, ollama: bool) -> Result<Self> {
         let api = ApiBuilder::new().build()?;
 
         let device = if candle_core::utils::cuda_is_available() {
@@ -69,7 +70,16 @@ impl Embedder {
         let mut tokenizer = Tokenizer::from_file(tokenizer_file).map_err(anyhow::Error::msg)?;
         tokenizer.with_padding(Some(tokenizers::PaddingParams::default()));
 
-        let model = if quantized {
+        let model = if ollama {
+            if !quantized {
+                anyhow::bail!("ollama + non-quantized is not supported right now");
+            }
+            info!("Initializing Ollama hf.co/Abiray/zembed-1-Q4_K_M-GGUF...");
+            let ollama_client = swiftide::integrations::ollama::Ollama::builder()
+                .default_embed_model("hf.co/Abiray/zembed-1-Q4_K_M-GGUF")
+                .build()?;
+            Model::Ollama(ollama_client)
+        } else if quantized {
             info!("Initializing 4-bit ONNX zembed-1...");
             // Load your local 4-bit ONNX file
             let model_path = "zembed_base/model_int4.onnx";
@@ -123,6 +133,9 @@ impl EmbeddingModel for Embedder {
     async fn embed(&self, input: Vec<String>) -> Result<Vec<Vec<f32>>, LanguageModelError> {
         let mut model_guard = self.model.lock().await;
 
+        let batch_size = input.len();
+        let start = std::time::Instant::now();
+
         let augmented_texts: Vec<String> =
             input.iter().map(|t| format!("{}<|im_end|>\n", t)).collect();
         let encodings = self
@@ -134,19 +147,44 @@ impl EmbeddingModel for Embedder {
             return Ok(vec![]);
         }
 
-        let batch_size = encodings.len();
+        let total_tokens: usize = encodings.iter().map(|e| e.get_ids().len()).sum();
         let seq_len = encodings[0].len();
 
         match &mut *model_guard {
+            Model::Ollama(ollama) => {
+                info!(
+                    "Submitting batch of {} chunks (~{} tokens) to Ollama",
+                    batch_size, total_tokens
+                );
+                let result = ollama.embed(input).await;
+                let duration = start.elapsed();
+                let secs = duration.as_secs_f64();
+                let tok_per_sec = if secs > 0.0 {
+                    total_tokens as f64 / secs
+                } else {
+                    0.0
+                };
+
+                info!(
+                    "Ollama embedding complete: {} chunks in {:.2?} ({:.2} tok/s)",
+                    batch_size, duration, tok_per_sec
+                );
+                result
+            }
             Model::Full(model) => {
+                info!(
+                    "Using full model (Candle) for embedding batch of {} chunks",
+                    batch_size
+                );
                 let mut input_ids_vec = Vec::with_capacity(batch_size * seq_len);
                 let mut attention_mask_vec = Vec::with_capacity(batch_size * seq_len);
                 for enc in &encodings {
                     input_ids_vec.extend(enc.get_ids().iter().copied());
                     attention_mask_vec.extend(enc.get_attention_mask().iter().map(|&m| m as f32));
                 }
-                let input_ids = Tensor::from_vec(input_ids_vec, (batch_size, seq_len), &self.device)
-                    .map_err(|e| LanguageModelError::permanent(e.to_string()))?;
+                let input_ids =
+                    Tensor::from_vec(input_ids_vec, (batch_size, seq_len), &self.device)
+                        .map_err(|e| LanguageModelError::permanent(e.to_string()))?;
                 let attention_mask_2d =
                     Tensor::from_vec(attention_mask_vec, (batch_size, seq_len), &self.device)
                         .map_err(|e| LanguageModelError::permanent(e.to_string()))?;
@@ -170,6 +208,7 @@ impl EmbeddingModel for Embedder {
                     .map_err(|e| LanguageModelError::permanent(e.to_string()))
             }
             Model::Quantized(session) => {
+                debug!("Using quantized model (ORT) for embedding");
                 // Prepare inputs for ONNX Runtime (requires i64 and ndarray)
                 let ids_vec: Vec<i64> = encodings
                     .iter()
@@ -180,11 +219,14 @@ impl EmbeddingModel for Embedder {
                     .flat_map(|e| e.get_attention_mask().iter().map(|&m| m as i64))
                     .collect();
 
-                let input_ids = Array2::from_shape_vec((batch_size, seq_len), ids_vec)
-                    .map_err(|e: ndarray::ShapeError| LanguageModelError::permanent(e.to_string()))?;
+                let input_ids = Array2::from_shape_vec((batch_size, seq_len), ids_vec).map_err(
+                    |e: ndarray::ShapeError| LanguageModelError::permanent(e.to_string()),
+                )?;
                 let attention_mask = Array2::from_shape_vec((batch_size, seq_len), mask_vec)
-                    .map_err(|e: ndarray::ShapeError| LanguageModelError::permanent(e.to_string()))?;
-                
+                    .map_err(|e: ndarray::ShapeError| {
+                        LanguageModelError::permanent(e.to_string())
+                    })?;
+
                 let mut position_ids = Array2::<i64>::zeros((batch_size, seq_len));
                 for b in 0..batch_size {
                     for s in 0..seq_len {
@@ -201,28 +243,37 @@ impl EmbeddingModel for Embedder {
 
                 let outputs = session
                     .run(vec![
-                        (Cow::from("input_ids"), SessionInputValue::from(input_ids_val)),
-                        (Cow::from("attention_mask"), SessionInputValue::from(attention_mask_val)),
-                        (Cow::from("position_ids"), SessionInputValue::from(position_ids_val)),
+                        (
+                            Cow::from("input_ids"),
+                            SessionInputValue::from(input_ids_val),
+                        ),
+                        (
+                            Cow::from("attention_mask"),
+                            SessionInputValue::from(attention_mask_val),
+                        ),
+                        (
+                            Cow::from("position_ids"),
+                            SessionInputValue::from(position_ids_val),
+                        ),
                     ])
                     .map_err(|e: ort::Error| LanguageModelError::permanent(e.to_string()))?;
 
-                let hidden_states_val = outputs.get("last_hidden_state")
+                let hidden_states_val = outputs
+                    .get("last_hidden_state")
                     .context("Missing last_hidden_state output")
                     .map_err(|e| LanguageModelError::permanent(e.to_string()))?;
 
-                let (shape, data) = hidden_states_val.try_extract_tensor::<f32>()
+                let (shape, data) = hidden_states_val
+                    .try_extract_tensor::<f32>()
                     .map_err(|e: ort::Error| LanguageModelError::permanent(e.to_string()))?;
 
                 let shape_vec: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
                 let view = ArrayViewD::from_shape(shape_vec, data)
                     .map_err(|e| LanguageModelError::permanent(e.to_string()))?;
-                
+
                 let mut results = Vec::with_capacity(batch_size);
                 for b in 0..batch_size {
-                    let last_token_vec = view
-                        .slice(ndarray::s![b, seq_len - 1, ..])
-                        .to_vec();
+                    let last_token_vec = view.slice(ndarray::s![b, seq_len - 1, ..]).to_vec();
                     results.push(l2_normalize_vec(last_token_vec));
                 }
 

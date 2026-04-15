@@ -12,7 +12,7 @@ anyhow = "1.0.96"
 clap = { version = "4.5.30", features = ["derive"] }
 hf-hub = "0.4.1"
 ignore = "0.4.23"
-kreuzberg = "4.8.4"
+kreuzberg = { version = "4.8.4", features = ["pdf", "office"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 serde = { version = "1.0.218", features = ["derive"] }
@@ -23,11 +23,12 @@ candle-nn = "0.9.2"
 candle-transformers = "0.9.2"
 tokenizers = "0.22.2"
 
-swiftide = { version = "0.32.1", features = ["lancedb"], git = "https://github.com/bosun-ai/swiftide" }
+swiftide = { version = "0.32.1", features = ["lancedb", "ollama"], git = "https://github.com/bosun-ai/swiftide" }
 lance-graph = "0.5.4"
 lancedb = "0.26"
 async-trait = "0.1.86"
 futures = "0.3.31"
+reqwest = { version = "0.12", features = ["json"] }
 fastembed = { git = "https://github.com/modpotato/fastembed-rs", branch = "main", features = ["qwen3"] }
 mime_guess = "2.0.5"
 blake3 = "1.8.4"
@@ -36,3 +37,14 @@ arrow-schema = "57.3.0"
 ort = { version = "2.0.0-rc.11", features = ["ndarray"] }
 num_cpus = "1.17.0"
 ndarray = "0.17.2"
+chrono = "0.4.44"
+glob = "0.3.3"
+uuid = { version = "1.15", features = ["v4", "v5"] }
+ollama-client = "0.1.0"
+tokio-stream = "0.1.18"
+
+[features]
+default = ["keywords-rake", "tree-sitter"]
+keywords-rake = ["kreuzberg/keywords-rake"]
+keywords-yake = ["kreuzberg/keywords-yake"]
+tree-sitter = ["kreuzberg/tree-sitter"]

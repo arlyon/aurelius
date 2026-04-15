@@ -12,6 +12,7 @@ use ingest::pipeline::run_ingest;
 use models::download::download_models;
 use query::ls::run_ls;
 use query::search::run_search;
+use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 #[tokio::main]
@@ -25,18 +26,18 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Models => {
-            println!("Downloading models...");
+            info!("Downloading models...");
             download_models(cli.quantized).await?;
-            println!("Models downloaded successfully.");
+            info!("Models downloaded successfully.");
         }
-        Commands::Ingest { path } => {
-            println!("Ingesting path: {:?} (quantized: {})", path, cli.quantized);
-            run_ingest(path, cli.quantized).await?;
-            println!("Ingestion complete.");
+        Commands::Ingest { path, invalidate_path, invalidate_before } => {
+            info!("Ingesting path: {:?} (quantized: {}, ollama: {})", path, cli.quantized, cli.ollama);
+            run_ingest(path, cli.quantized, cli.ollama, invalidate_path, invalidate_before).await?;
+            info!("Ingestion complete.");
         }
         Commands::Search { query } => {
-            println!("Searching for: {} (quantized: {})", query, cli.quantized);
-            run_search(query, cli.quantized).await?;
+            info!("Searching for: {} (quantized: {}, ollama: {})", query, cli.quantized, cli.ollama);
+            run_search(query, cli.quantized, cli.ollama).await?;
         }
         Commands::Ls => {
             run_ls().await?;

@@ -1,9 +1,16 @@
 use crate::models::zembed::Embedder;
 use anyhow::Result;
+use arrow_array;
+use arrow_array::RecordBatchIterator;
+use arrow_schema;
 use async_trait::async_trait;
 use blake3;
-use kreuzberg::{ExtractionConfig, extract_file};
+use chrono::{DateTime, Utc};
+use futures::TryStreamExt;
+use kreuzberg::{ChunkerType, ChunkingConfig, ExtractionConfig, extract_file};
+use lancedb::query::{ExecutableQuery, QueryBase};
 use std::path::PathBuf;
+use std::sync::Arc;
 use swiftide::indexing::{self, IndexingStream, Node};
 use swiftide::integrations::lancedb::LanceDB;
 use swiftide::traits::{Loader, NodeCache, Transformer, WithIndexingDefaults};
@@ -30,14 +37,16 @@ impl Loader for GitignoreLoader {
             .into_iter()
             .flat_map(|p| {
                 let files = crate::ingest::walker::walk_directory(p);
-                info!("Found {} files to process", files.len());
                 files.into_iter().filter_map(|p| {
                     let path_str = p.to_string_lossy().to_string();
-                    debug!("Preparing node for {:?}", path_str);
 
                     // Hash the file for caching
                     let hash = match std::fs::read(&p) {
-                        Ok(bytes) => blake3::hash(&bytes).to_hex().to_string(),
+                        Ok(bytes) => {
+                            let h = blake3::hash(&bytes).to_hex().to_string();
+                            debug!("Hashed file {:?}: {}", p, h);
+                            h
+                        }
                         Err(e) => {
                             warn!("Failed to read file for hashing at {:?}: {}", p, e);
                             return None;
@@ -62,42 +71,134 @@ pub struct KreuzbergTransformer;
 impl WithIndexingDefaults for KreuzbergTransformer {}
 
 #[async_trait]
-impl Transformer for KreuzbergTransformer {
+impl swiftide::traits::ChunkerTransformer for KreuzbergTransformer {
     type Input = String;
     type Output = String;
 
-    async fn transform_node(&self, mut node: Node<Self::Input>) -> Result<Node<Self::Output>> {
+    async fn transform_node(&self, mut node: Node<Self::Input>) -> IndexingStream<Self::Output> {
         let path_str = node
             .metadata
             .get("path")
-            .ok_or_else(|| anyhow::anyhow!("Node missing path metadata"))?
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Path metadata is not a string"))?;
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        if path_str.is_empty() {
+            return IndexingStream::from_nodes(vec![node]);
+        }
 
         let path = PathBuf::from(path_str);
         debug!("Extracting content from {:?}", path);
 
-        let config = ExtractionConfig::default();
+        // Try to determine a good chunker type based on extension
+        let chunker_type = match path.extension().and_then(|ext| ext.to_str()) {
+            Some("md") => Some(ChunkerType::Markdown),
+            Some("yaml") | Some("yml") => Some(ChunkerType::Yaml),
+            _ => Some(ChunkerType::Text),
+        };
+
+        let mut config = ExtractionConfig::default();
+        if let Some(ct) = chunker_type {
+            config.chunking = Some(ChunkingConfig {
+                chunker_type: ct,
+                max_characters: 512,
+                overlap: 50,
+                ..Default::default()
+            });
+        }
+
         match extract_file(&path, None, &config).await {
             Ok(result) => {
-                debug!(
-                    "Successfully extracted {} characters from {:?}",
-                    result.content.len(),
-                    path
-                );
+                debug!("Successfully extracted content from {:?}", path);
+
+                // Common metadata for all chunks
+                node.metadata
+                    .insert("mime_type".to_string(), result.mime_type.to_string());
+
+                if let Some(title) = &result.metadata.title {
+                    node.metadata.insert("title".to_string(), title.to_string());
+                }
+                if let Some(authors) = &result.metadata.authors {
+                    node.metadata
+                        .insert("authors".to_string(), authors.join(", "));
+                }
+                if let Some(lang) = &result.metadata.language {
+                    node.metadata
+                        .insert("language".to_string(), lang.to_string());
+                }
+
+                #[cfg(any(feature = "keywords-yake", feature = "keywords-rake"))]
+                if let Some(keywords) = &result.extracted_keywords {
+                    let kw_str = keywords
+                        .iter()
+                        .map(|k| k.text.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    node.metadata.insert("keywords".to_string(), kw_str);
+                }
+
+                #[cfg(feature = "tree-sitter")]
+                if let Some(code) = &result.code_intelligence {
+                    let mut symbols = Vec::new();
+                    for func in &code.imports {
+                        symbols.push(func.source.clone());
+                    }
+                    for class in &code.exports {
+                        symbols.push(class.name.clone());
+                    }
+                    for sym in &code.symbols {
+                        symbols.push(sym.name.clone());
+                    }
+
+                    if !symbols.is_empty() {
+                        node.metadata
+                            .insert("code_symbols".to_string(), symbols.join(" "));
+                    }
+                }
+
+                if let Some(chunks) = result.chunks {
+                    if !chunks.is_empty() {
+                        let mut nodes = Vec::new();
+                        for (i, chunk) in chunks.into_iter().enumerate() {
+                            let mut chunk_node = node.clone();
+                            chunk_node.chunk = chunk.content;
+                            chunk_node
+                                .metadata
+                                .insert("chunk_index".to_string(), i as i64);
+                            chunk_node
+                                .metadata
+                                .insert("chunked_by".to_string(), "kreuzberg".to_string());
+
+                            if let Some(hc) = chunk.metadata.heading_context {
+                                let breadcrumbs = hc
+                                    .headings
+                                    .iter()
+                                    .map(|h| h.text.clone())
+                                    .collect::<Vec<_>>()
+                                    .join(" > ");
+                                chunk_node
+                                    .metadata
+                                    .insert("heading_context".to_string(), breadcrumbs);
+                            }
+
+                            nodes.push(chunk_node);
+                        }
+                        return IndexingStream::from_nodes(nodes);
+                    }
+                }
+
+                // Fallback: use the whole content and let the next pipeline step handle it
                 node.chunk = result.content;
+                IndexingStream::from_nodes(vec![node])
             }
             Err(e) => {
                 warn!(
                     "Failed to extract content from {:?}: {}. Skipping file.",
                     path, e
                 );
-                // Silently skip files that can't be processed (e.g. unknown mime types)
                 node.chunk = "".to_string();
+                IndexingStream::from_nodes(vec![node])
             }
         }
-
-        Ok(node)
     }
 }
 
@@ -118,7 +219,30 @@ impl Transformer for ContextPrependTransformer {
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
 
-        let global_context = format!("File: {}\n---\n", path_str);
+        let mut header = format!("File: {}\n", path_str);
+
+        if let Some(title) = node.metadata.get("title").and_then(|v| v.as_str()) {
+            header.push_str(&format!("Title: {}\n", title));
+        }
+        if let Some(authors) = node.metadata.get("authors").and_then(|v| v.as_str()) {
+            header.push_str(&format!("Authors: {}\n", authors));
+        }
+        if let Some(mime) = node.metadata.get("mime_type").and_then(|v| v.as_str()) {
+            header.push_str(&format!("Format: {}\n", mime));
+        }
+        if let Some(lang) = node.metadata.get("language").and_then(|v| v.as_str()) {
+            header.push_str(&format!("Language: {}\n", lang));
+        }
+
+        if let Some(context) = node
+            .metadata
+            .get("heading_context")
+            .and_then(|v| v.as_str())
+        {
+            header.push_str(&format!("Context: {}\n", context));
+        }
+
+        let global_context = format!("{}---\n", header);
         node.chunk = format!("{}{}", global_context, node.chunk);
 
         Ok(node)
@@ -146,42 +270,287 @@ impl Transformer for LogTransformer {
     }
 }
 
-#[derive(Clone, Default, Debug)]
-struct Cache;
+#[derive(Clone, Default)]
+pub struct NodeIdTransformer;
+
+impl WithIndexingDefaults for NodeIdTransformer {}
+
+#[async_trait]
+impl Transformer for NodeIdTransformer {
+    type Input = String;
+    type Output = String;
+
+    async fn transform_node(&self, mut node: Node<Self::Input>) -> Result<Node<Self::Output>> {
+        let path = node
+            .metadata
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let chunk = &node.chunk;
+
+        // Generate a stable UUID based on path and chunk content
+        // This namespace is just a random UUID for our project
+        let namespace = uuid::Uuid::from_bytes([
+            0x67, 0x6e, 0x6f, 0x6d, 0x65, 0x2d, 0x72, 0x65, 0x63, 0x61, 0x6c, 0x6c, 0x2d, 0x69,
+            0x64, 0x73,
+        ]);
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(path.as_bytes());
+        hasher.update(chunk.as_bytes());
+        let hash_bytes = hasher.finalize();
+
+        let id = uuid::Uuid::new_v5(&namespace, hash_bytes.as_bytes());
+
+        // node.id = id;
+
+        Ok(node)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Cache {
+    cache_table: lancedb::table::Table,
+    chunks_table: lancedb::table::Table,
+}
+
+impl Cache {
+    pub async fn new(
+        db: &lancedb::Connection,
+        chunks_table: lancedb::table::Table,
+    ) -> Result<Self> {
+        let table_name = "cache";
+        let cache_table = match db.open_table(table_name).execute().await {
+            Ok(t) => t,
+            Err(_) => {
+                let schema = Arc::new(arrow_schema::Schema::new(vec![
+                    arrow_schema::Field::new("path", arrow_schema::DataType::Utf8, false),
+                    arrow_schema::Field::new("hash", arrow_schema::DataType::Utf8, false),
+                    arrow_schema::Field::new(
+                        "last_ingested_at",
+                        arrow_schema::DataType::Timestamp(
+                            arrow_schema::TimeUnit::Microsecond,
+                            None,
+                        ),
+                        false,
+                    ),
+                ]));
+                db.create_empty_table(table_name, schema).execute().await?
+            }
+        };
+        Ok(Self {
+            cache_table,
+            chunks_table,
+        })
+    }
+
+    pub async fn invalidate(
+        &self,
+        path_glob: Option<&str>,
+        before: Option<DateTime<Utc>>,
+    ) -> Result<()> {
+        let mut conditions = Vec::new();
+
+        if let Some(glob) = path_glob {
+            let sql_glob = glob.replace('*', "%").replace('?', "_");
+            conditions.push(format!("path LIKE '{}'", sql_glob));
+        }
+
+        if let Some(before_dt) = before {
+            conditions.push(format!(
+                "last_ingested_at < {}",
+                before_dt.timestamp_micros()
+            ));
+        }
+
+        if !conditions.is_empty() {
+            let filter = conditions.join(" AND ");
+            info!("Invalidating cache with filter: {}", filter);
+            self.cache_table.delete(&filter).await?;
+        }
+
+        Ok(())
+    }
+}
 
 #[async_trait::async_trait]
 impl NodeCache for Cache {
     type Input = String;
 
-    async fn get(&self, _node: &Node<Self::Input>) -> bool {
+    async fn get(&self, node: &Node<Self::Input>) -> bool {
+        let path = node.metadata.get("path").and_then(|v| v.as_str());
+        let hash = node.metadata.get("hash").and_then(|v| v.as_str());
+
+        if let (Some(path), Some(hash)) = (path, hash) {
+            let query = format!("path = '{}' AND hash = '{}'", path, hash);
+            if let Ok(result) = self.cache_table.query().only_if(query).execute().await {
+                if let Ok(batches) = result.try_collect::<Vec<arrow_array::RecordBatch>>().await {
+                    if batches.iter().any(|b| b.num_rows() > 0) {
+                        return true;
+                    }
+                }
+            }
+
+            // If we are here, the file is either new or modified.
+            // Invalidate old chunks for this path.
+            debug!("Invalidating old chunks for path: {}", path);
+            let _ = self
+                .chunks_table
+                .delete(&format!("path = '{}'", path))
+                .await;
+
+            // Also remove from cache table to be clean, though set() will overwrite/append
+            let _ = self.cache_table.delete(&format!("path = '{}'", path)).await;
+        }
         false
     }
-    async fn set(&self, _node: &Node<Self::Input>) {}
+
+    async fn set(&self, node: &Node<Self::Input>) {
+        let path = node.metadata.get("path").and_then(|v| v.as_str());
+        let hash = node.metadata.get("hash").and_then(|v| v.as_str());
+
+        if let (Some(path), Some(hash)) = (path, hash) {
+            let last_ingested_at = Utc::now().timestamp_micros();
+            let batch = arrow_array::RecordBatch::try_new(
+                self.cache_table.schema().await.unwrap(),
+                vec![
+                    Arc::new(arrow_array::StringArray::from(vec![path])),
+                    Arc::new(arrow_array::StringArray::from(vec![hash])),
+                    Arc::new(arrow_array::TimestampMicrosecondArray::from(vec![
+                        last_ingested_at,
+                    ])),
+                ],
+            )
+            .unwrap();
+
+            let reader =
+                RecordBatchIterator::new(vec![Ok(batch)], self.cache_table.schema().await.unwrap());
+            let _ = self.cache_table.add(reader).execute().await;
+        }
+    }
 }
 
-pub async fn run_ingest(path: Vec<PathBuf>, quantized: bool) -> Result<()> {
+#[derive(Clone)]
+pub struct ConditionalChunker {
+    inner: indexing::transformers::ChunkMarkdown,
+}
+
+impl ConditionalChunker {
+    pub fn new(range: std::ops::Range<usize>) -> Self {
+        Self {
+            inner: indexing::transformers::ChunkMarkdown::from_chunk_range(range),
+        }
+    }
+}
+
+#[async_trait]
+impl swiftide::traits::ChunkerTransformer for ConditionalChunker {
+    type Input = String;
+    type Output = String;
+
+    async fn transform_node(&self, node: Node<Self::Input>) -> IndexingStream<Self::Output> {
+        if node.metadata.get("chunked_by").is_some() {
+            IndexingStream::from_nodes(vec![node])
+        } else {
+            self.inner.transform_node(node).await
+        }
+    }
+}
+
+pub async fn run_ingest(
+    path: Vec<PathBuf>,
+    quantized: bool,
+    ollama: bool,
+    invalidate_path: Option<String>,
+    invalidate_before: Option<String>,
+) -> Result<()> {
     info!("Starting ingestion for {:?}", path);
 
-    let embedder = Embedder::new(quantized).await?;
+    let embedder = Embedder::new(quantized, ollama).await?;
+
+    let db_path = "aurelius_db";
+    let db = lancedb::connect(db_path).execute().await?;
+
+    let table_name = "chunks";
+    let chunks_table = match db.open_table(table_name).execute().await {
+        Ok(t) => t,
+        Err(_) => {
+            let schema = Arc::new(arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new(
+                    "id",
+                    arrow_schema::DataType::FixedSizeList(
+                        Arc::new(arrow_schema::Field::new(
+                            "item",
+                            arrow_schema::DataType::UInt8,
+                            true,
+                        )),
+                        16,
+                    ),
+                    false,
+                ),
+                arrow_schema::Field::new("chunk", arrow_schema::DataType::Utf8, false),
+                arrow_schema::Field::new("path", arrow_schema::DataType::Utf8, false),
+                arrow_schema::Field::new("mime_type", arrow_schema::DataType::Utf8, true),
+                arrow_schema::Field::new("title", arrow_schema::DataType::Utf8, true),
+                arrow_schema::Field::new("authors", arrow_schema::DataType::Utf8, true),
+                arrow_schema::Field::new("language", arrow_schema::DataType::Utf8, true),
+                arrow_schema::Field::new("hash", arrow_schema::DataType::Utf8, true),
+                arrow_schema::Field::new("keywords", arrow_schema::DataType::Utf8, true),
+                arrow_schema::Field::new("code_symbols", arrow_schema::DataType::Utf8, true),
+            ]));
+            db.create_empty_table(table_name, schema).execute().await?
+        }
+    };
+
+    let cache = Cache::new(&db, chunks_table).await?;
+
+    // Apply invalidation rules
+    let before_dt = if let Some(before_str) = invalidate_before {
+        if let Ok(dt) = DateTime::parse_from_rfc3339(&before_str) {
+            Some(dt.with_timezone(&Utc))
+        } else if before_str.ends_with('h') {
+            let hours: i64 = before_str.trim_end_matches('h').parse()?;
+            Some(Utc::now() - chrono::Duration::hours(hours))
+        } else if before_str.ends_with('d') {
+            let days: i64 = before_str.trim_end_matches('d').parse()?;
+            Some(Utc::now() - chrono::Duration::days(days))
+        } else {
+            anyhow::bail!("Invalid date format for invalidate-before. Use RFC3339 or '1h', '2d'.");
+        }
+    } else {
+        None
+    };
+
+    if invalidate_path.is_some() || before_dt.is_some() {
+        cache
+            .invalidate(invalidate_path.as_deref(), before_dt)
+            .await?;
+    }
 
     let lancedb = LanceDB::builder()
-        .uri("aurelius_db")
-        .table_name("chunks")
+        .uri(db_path)
+        .table_name(table_name)
         .vector_size(2560) // zembed-1 dimension
         .with_vector(indexing::EmbeddedField::Combined)
         .with_metadata("path")
+        .with_metadata("mime_type")
+        .with_metadata("title")
+        .with_metadata("authors")
+        .with_metadata("language")
+        .with_metadata("hash")
+        .with_metadata("keywords")
+        .with_metadata("code_symbols")
         .build()?;
 
     let loader = GitignoreLoader::new(path);
 
     indexing::Pipeline::from_loader(loader)
         .with_concurrency(1)
-        .filter_cached(Cache)
-        .then(KreuzbergTransformer::default())
+        .filter_cached(cache)
+        .then_chunk(KreuzbergTransformer::default())
         .then(LogTransformer::default())
-        .then_chunk(indexing::transformers::ChunkMarkdown::from_chunk_range(
-            100..500,
-        ))
+        .then_chunk(ConditionalChunker::new(100..500))
         .filter(|node| node.as_ref().map(|n| !n.chunk.is_empty()).unwrap_or(false))
         .then(ContextPrependTransformer::default())
         .then_in_batch(indexing::transformers::Embed::new(embedder))
