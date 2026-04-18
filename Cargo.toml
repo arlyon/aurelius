@@ -43,6 +43,7 @@ glob = "0.3.3"
 uuid = { version = "1.15", features = ["v4", "v5"] }
 ollama-client = "0.1.0"
 tokio-stream = "0.1.18"
+ascent = "0.7"
 
 [features]
 default = ["keywords-rake", "tree-sitter"]

@@ -38,7 +38,8 @@ pub enum Commands {
     /// Download the required models (zembed-1 and gemma-4-E4B).
     Models,
 
-    /// Ingest a directory of files into the local knowledge graph.
+    /// Ingest a directory of files into the local knowledge graph, then extract facts.
+    /// Pass --no-extract to skip fact extraction.
     Ingest {
         /// The path to the directory to ingest.
         path: Vec<PathBuf>,
@@ -50,7 +51,15 @@ pub enum Commands {
         /// Invalidate cache for entries added before this date (RFC3339 or '1h', '2d' offset).
         #[arg(long)]
         invalidate_before: Option<String>,
+
+        /// Skip fact extraction after ingestion (do not load Qwen).
+        #[arg(long)]
+        no_extract: bool,
     },
+
+    /// Extract typed atomic facts from ingested chunks via Qwen (qwen3:8b, Ollama).
+    /// Idempotent: skips context windows already present in the facts table.
+    ExtractFacts,
 
     /// Search the knowledge graph and generate a response.
     Search {
