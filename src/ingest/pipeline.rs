@@ -1,4 +1,5 @@
 use crate::models::zembed::Embedder;
+use uuid;
 use anyhow::Result;
 use arrow_array;
 use arrow_array::RecordBatchIterator;
@@ -8,6 +9,7 @@ use blake3;
 use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
 use kreuzberg::{ChunkerType, ChunkingConfig, ExtractionConfig, extract_file};
+use lancedb::index::scalar::FtsIndexBuilder;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -100,8 +102,8 @@ impl swiftide::traits::ChunkerTransformer for KreuzbergTransformer {
         if let Some(ct) = chunker_type {
             config.chunking = Some(ChunkingConfig {
                 chunker_type: ct,
-                max_characters: 512,
-                overlap: 50,
+                max_characters: 1500,
+                overlap: 0,
                 ..Default::default()
             });
         }
@@ -270,45 +272,6 @@ impl Transformer for LogTransformer {
     }
 }
 
-#[derive(Clone, Default)]
-pub struct NodeIdTransformer;
-
-impl WithIndexingDefaults for NodeIdTransformer {}
-
-#[async_trait]
-impl Transformer for NodeIdTransformer {
-    type Input = String;
-    type Output = String;
-
-    async fn transform_node(&self, mut node: Node<Self::Input>) -> Result<Node<Self::Output>> {
-        let path = node
-            .metadata
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        let chunk = &node.chunk;
-
-        // Generate a stable UUID based on path and chunk content
-        // This namespace is just a random UUID for our project
-        let namespace = uuid::Uuid::from_bytes([
-            0x67, 0x6e, 0x6f, 0x6d, 0x65, 0x2d, 0x72, 0x65, 0x63, 0x61, 0x6c, 0x6c, 0x2d, 0x69,
-            0x64, 0x73,
-        ]);
-
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(path.as_bytes());
-        hasher.update(chunk.as_bytes());
-        let hash_bytes = hasher.finalize();
-
-        let id = uuid::Uuid::new_v5(&namespace, hash_bytes.as_bytes());
-
-        // node.id = id;
-
-        Ok(node)
-    }
-}
-
 #[derive(Clone, Debug)]
 struct Cache {
     cache_table: lancedb::table::Table,
@@ -431,30 +394,55 @@ impl NodeCache for Cache {
     }
 }
 
-#[derive(Clone)]
-pub struct ConditionalChunker {
-    inner: indexing::transformers::ChunkMarkdown,
-}
+#[derive(Clone, Default)]
+pub struct HierarchicalChunker;
 
-impl ConditionalChunker {
-    pub fn new(range: std::ops::Range<usize>) -> Self {
-        Self {
-            inner: indexing::transformers::ChunkMarkdown::from_chunk_range(range),
-        }
-    }
-}
+impl WithIndexingDefaults for HierarchicalChunker {}
 
 #[async_trait]
-impl swiftide::traits::ChunkerTransformer for ConditionalChunker {
+impl swiftide::traits::ChunkerTransformer for HierarchicalChunker {
     type Input = String;
     type Output = String;
 
     async fn transform_node(&self, node: Node<Self::Input>) -> IndexingStream<Self::Output> {
-        if node.metadata.get("chunked_by").is_some() {
-            IndexingStream::from_nodes(vec![node])
-        } else {
-            self.inner.transform_node(node).await
+        if node.chunk.is_empty() {
+            return IndexingStream::from_nodes(vec![]);
         }
+
+        let context_window_id = uuid::Uuid::new_v4().to_string();
+        let parent_text = node.chunk.clone();
+        let chars: Vec<char> = parent_text.chars().collect();
+        let total = chars.len();
+
+        const CHILD_SIZE: usize = 300;
+        const STEP: usize = 250;
+
+        if total <= CHILD_SIZE {
+            let mut child = node;
+            child.metadata.insert("context_window_id".to_string(), context_window_id);
+            child.metadata.insert("parent_block".to_string(), parent_text);
+            return IndexingStream::from_nodes(vec![child]);
+        }
+
+        let mut children = Vec::new();
+        let mut start = 0usize;
+        loop {
+            let end = (start + CHILD_SIZE).min(total);
+            let child_text: String = chars[start..end].iter().collect();
+
+            let mut child = node.clone();
+            child.chunk = child_text;
+            child.metadata.insert("context_window_id".to_string(), context_window_id.clone());
+            child.metadata.insert("parent_block".to_string(), parent_text.clone());
+            children.push(child);
+
+            if end >= total {
+                break;
+            }
+            start += STEP;
+        }
+
+        IndexingStream::from_nodes(children)
     }
 }
 
@@ -462,44 +450,75 @@ pub async fn run_ingest(
     path: Vec<PathBuf>,
     quantized: bool,
     ollama: bool,
+    lemonade: Option<(String, String)>,
     invalidate_path: Option<String>,
     invalidate_before: Option<String>,
 ) -> Result<()> {
     info!("Starting ingestion for {:?}", path);
 
-    let embedder = Embedder::new(quantized, ollama).await?;
+    let lemonade_ref = lemonade.as_ref().map(|(url, model)| (url.as_str(), model.as_str()));
+    let embedder = Embedder::new(quantized, ollama, lemonade_ref).await?;
 
     let db_path = "aurelius_db";
     let db = lancedb::connect(db_path).execute().await?;
 
     let table_name = "chunks";
+    let chunks_schema = Arc::new(arrow_schema::Schema::new(vec![
+        arrow_schema::Field::new(
+            "vector_combined",
+            arrow_schema::DataType::FixedSizeList(
+                Arc::new(arrow_schema::Field::new(
+                    "item",
+                    arrow_schema::DataType::Float32,
+                    true,
+                )),
+                2560,
+            ),
+            true,
+        ),
+        arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::FixedSizeList(
+                Arc::new(arrow_schema::Field::new(
+                    "item",
+                    arrow_schema::DataType::UInt8,
+                    true,
+                )),
+                16,
+            ),
+            false,
+        ),
+        arrow_schema::Field::new("chunk", arrow_schema::DataType::Utf8, false),
+        arrow_schema::Field::new("path", arrow_schema::DataType::Utf8, false),
+        arrow_schema::Field::new("mime_type", arrow_schema::DataType::Utf8, true),
+        arrow_schema::Field::new("title", arrow_schema::DataType::Utf8, true),
+        arrow_schema::Field::new("authors", arrow_schema::DataType::Utf8, true),
+        arrow_schema::Field::new("language", arrow_schema::DataType::Utf8, true),
+        arrow_schema::Field::new("hash", arrow_schema::DataType::Utf8, true),
+        arrow_schema::Field::new("keywords", arrow_schema::DataType::Utf8, true),
+        arrow_schema::Field::new("code_symbols", arrow_schema::DataType::Utf8, true),
+        arrow_schema::Field::new("context_window_id", arrow_schema::DataType::Utf8, true),
+        arrow_schema::Field::new("parent_block", arrow_schema::DataType::Utf8, true),
+    ]));
     let chunks_table = match db.open_table(table_name).execute().await {
-        Ok(t) => t,
+        Ok(t) => {
+            // Drop and recreate if schema is missing required fields
+            let existing_schema = t.schema().await?;
+            if existing_schema.field_with_name("vector_combined").is_err()
+                || existing_schema.field_with_name("context_window_id").is_err()
+            {
+                db.drop_table(table_name, &[]).await?;
+                db.create_empty_table(table_name, chunks_schema)
+                    .execute()
+                    .await?
+            } else {
+                t
+            }
+        }
         Err(_) => {
-            let schema = Arc::new(arrow_schema::Schema::new(vec![
-                arrow_schema::Field::new(
-                    "id",
-                    arrow_schema::DataType::FixedSizeList(
-                        Arc::new(arrow_schema::Field::new(
-                            "item",
-                            arrow_schema::DataType::UInt8,
-                            true,
-                        )),
-                        16,
-                    ),
-                    false,
-                ),
-                arrow_schema::Field::new("chunk", arrow_schema::DataType::Utf8, false),
-                arrow_schema::Field::new("path", arrow_schema::DataType::Utf8, false),
-                arrow_schema::Field::new("mime_type", arrow_schema::DataType::Utf8, true),
-                arrow_schema::Field::new("title", arrow_schema::DataType::Utf8, true),
-                arrow_schema::Field::new("authors", arrow_schema::DataType::Utf8, true),
-                arrow_schema::Field::new("language", arrow_schema::DataType::Utf8, true),
-                arrow_schema::Field::new("hash", arrow_schema::DataType::Utf8, true),
-                arrow_schema::Field::new("keywords", arrow_schema::DataType::Utf8, true),
-                arrow_schema::Field::new("code_symbols", arrow_schema::DataType::Utf8, true),
-            ]));
-            db.create_empty_table(table_name, schema).execute().await?
+            db.create_empty_table(table_name, chunks_schema)
+                .execute()
+                .await?
         }
     };
 
@@ -541,6 +560,8 @@ pub async fn run_ingest(
         .with_metadata("hash")
         .with_metadata("keywords")
         .with_metadata("code_symbols")
+        .with_metadata("context_window_id")
+        .with_metadata("parent_block")
         .build()?;
 
     let loader = GitignoreLoader::new(path);
@@ -550,13 +571,31 @@ pub async fn run_ingest(
         .filter_cached(cache)
         .then_chunk(KreuzbergTransformer::default())
         .then(LogTransformer::default())
-        .then_chunk(ConditionalChunker::new(100..500))
+        .then_chunk(HierarchicalChunker::default())
         .filter(|node| node.as_ref().map(|n| !n.chunk.is_empty()).unwrap_or(false))
         .then(ContextPrependTransformer::default())
         .then_in_batch(indexing::transformers::Embed::new(embedder))
         .then_store_with(lancedb)
         .run()
         .await?;
+
+    // Ensure FTS index exists on the chunk column for BM25 search
+    let chunks_table = db.open_table(table_name).execute().await?;
+    if let Err(e) = chunks_table
+        .create_index(
+            &["chunk"],
+            lancedb::index::Index::FTS(FtsIndexBuilder::default()),
+        )
+        .execute()
+        .await
+    {
+        warn!(
+            "Failed to create FTS index (search will fall back to vector only): {}",
+            e
+        );
+    } else {
+        info!("FTS index on 'chunk' column ready");
+    }
 
     info!("Ingestion complete");
     Ok(())

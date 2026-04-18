@@ -31,13 +31,15 @@ async fn main() -> Result<()> {
             info!("Models downloaded successfully.");
         }
         Commands::Ingest { path, invalidate_path, invalidate_before } => {
-            info!("Ingesting path: {:?} (quantized: {}, ollama: {})", path, cli.quantized, cli.ollama);
-            run_ingest(path, cli.quantized, cli.ollama, invalidate_path, invalidate_before).await?;
+            let lemonade = cli.lemonade.then(|| (cli.lemonade_url.clone(), cli.lemonade_embed_model.clone()));
+            info!("Ingesting path: {:?} (quantized: {}, ollama: {}, lemonade: {})", path, cli.quantized, cli.ollama, cli.lemonade);
+            run_ingest(path, cli.quantized, cli.ollama, lemonade, invalidate_path, invalidate_before).await?;
             info!("Ingestion complete.");
         }
-        Commands::Search { query } => {
-            info!("Searching for: {} (quantized: {}, ollama: {})", query, cli.quantized, cli.ollama);
-            run_search(query, cli.quantized, cli.ollama).await?;
+        Commands::Search { query, no_think } => {
+            let lemonade = cli.lemonade.then(|| (cli.lemonade_url.clone(), cli.lemonade_embed_model.clone(), cli.lemonade_llm_model.clone()));
+            info!("Searching for: {} (quantized: {}, ollama: {}, lemonade: {})", query, cli.quantized, cli.ollama, cli.lemonade);
+            run_search(query, cli.quantized, cli.ollama, lemonade, !no_think).await?;
         }
         Commands::Ls => {
             run_ls().await?;

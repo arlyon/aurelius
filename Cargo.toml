@@ -25,6 +25,7 @@ tokenizers = "0.22.2"
 
 swiftide = { version = "0.32.1", features = ["lancedb", "ollama"], git = "https://github.com/bosun-ai/swiftide" }
 lance-graph = "0.5.4"
+lance-index = "2.0.0"
 lancedb = "0.26"
 async-trait = "0.1.86"
 futures = "0.3.31"

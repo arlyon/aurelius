@@ -13,6 +13,22 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub ollama: bool,
 
+    /// Use lemonade for embeddings and LLM (OpenAI-compatible local server).
+    #[arg(long, global = true)]
+    pub lemonade: bool,
+
+    /// Lemonade server base URL.
+    #[arg(long, global = true, default_value = "http://localhost:13305")]
+    pub lemonade_url: String,
+
+    /// Lemonade embedding model name.
+    #[arg(long, global = true, default_value = "user.zembed-1")]
+    pub lemonade_embed_model: String,
+
+    /// Lemonade LLM model name.
+    #[arg(long, global = true, default_value = "user.Qwen3.6-35B-A3B-GGUF-UD-Q4_K_M")]
+    pub lemonade_llm_model: String,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -40,6 +56,10 @@ pub enum Commands {
     Search {
         /// The natural language query.
         query: String,
+
+        /// Disable thinking mode for the Gemma synthesis call.
+        #[arg(long)]
+        no_think: bool,
     },
 
     /// List all ingested files in the database.

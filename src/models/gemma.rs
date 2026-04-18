@@ -6,10 +6,11 @@ use candle_transformers::models::gemma::{Config, Model};
 use hf_hub::api::tokio::ApiBuilder;
 use ollama_client::OllamaClient;
 use ollama_client::types::Options;
+use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
+use futures::StreamExt as FuturesStreamExt;
 use std::pin::pin;
 use tokenizers::Tokenizer;
-use tokio_stream::StreamExt;
 use tracing::{debug, info};
 
 pub enum ModelKind {
@@ -22,6 +23,11 @@ pub enum ModelKind {
         client: OllamaClient,
         model: String,
     },
+    Lemonade {
+        client: reqwest::Client,
+        base_url: String,
+        model: String,
+    },
 }
 
 pub struct Gemma {
@@ -31,8 +37,15 @@ pub struct Gemma {
 }
 
 impl Gemma {
-    pub async fn new(ollama: bool) -> Result<Self> {
-        let kind = if ollama {
+    pub async fn new(ollama: bool, lemonade: Option<(&str, &str)>) -> Result<Self> {
+        let kind = if let Some((base_url, llm_model)) = lemonade {
+            info!("Initializing Lemonade LLM (model: {llm_model}, url: {base_url})...");
+            ModelKind::Lemonade {
+                client: reqwest::Client::new(),
+                base_url: base_url.to_string(),
+                model: llm_model.to_string(),
+            }
+        } else if ollama {
             let model_name = "gemma4:26b";
             info!("Initializing Ollama Gemma ({model_name})...");
             let client = OllamaClient::new();
@@ -103,9 +116,10 @@ impl Gemma {
         // Take kind out of self to avoid borrow checker issues with self.process_token
         let mut kind = std::mem::replace(
             &mut self.kind,
-            ModelKind::Ollama {
-                client: OllamaClient::new(),
-                model: "".to_string(),
+            ModelKind::Lemonade {
+                client: reqwest::Client::new(),
+                base_url: String::new(),
+                model: String::new(),
             },
         );
 
@@ -132,7 +146,7 @@ impl Gemma {
 
                 let mut stream = pin!(stream);
 
-                while let Some(chunk) = stream.next().await {
+                while let Some(chunk) = tokio_stream::StreamExt::next(&mut stream).await {
                     let chunk = chunk.map_err(|e| anyhow::anyhow!("Ollama stream error: {}", e))?;
 
                     // Direct access to thinking field from ollama-client's GenerateStreamChunk
@@ -162,6 +176,96 @@ impl Gemma {
                             print!("{output}");
                             full_response.push_str(&output);
                             io::stdout().flush()?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            ModelKind::Lemonade { client, base_url, model } => {
+                debug!("Starting Lemonade streaming generation with model: {}", model);
+
+                #[derive(Serialize)]
+                struct Message<'a> {
+                    role: &'a str,
+                    content: &'a str,
+                }
+
+                #[derive(Serialize)]
+                struct ChatRequest<'a> {
+                    model: &'a str,
+                    messages: Vec<Message<'a>>,
+                    stream: bool,
+                    temperature: f32,
+                    top_p: f32,
+                }
+
+                #[derive(Deserialize)]
+                struct Delta {
+                    content: Option<String>,
+                }
+
+                #[derive(Deserialize)]
+                struct Choice {
+                    delta: Delta,
+                }
+
+                #[derive(Deserialize)]
+                struct ChatChunk {
+                    choices: Vec<Choice>,
+                }
+
+                let url = format!("{}/api/v1/chat/completions", base_url);
+                let req_body = ChatRequest {
+                    model,
+                    messages: vec![Message { role: "user", content: prompt }],
+                    stream: true,
+                    temperature: 1.0,
+                    top_p: 0.95,
+                };
+
+                let resp = client
+                    .post(&url)
+                    .json(&req_body)
+                    .send()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to start Lemonade stream: {}", e))?;
+
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(anyhow::anyhow!("Lemonade chat error {status}: {body}"));
+                }
+
+                let mut byte_stream = resp.bytes_stream();
+                let mut buf = String::new();
+
+                while let Some(chunk) = FuturesStreamExt::next(&mut byte_stream).await {
+                    let chunk = chunk.map_err(|e| anyhow::anyhow!("Lemonade stream error: {}", e))?;
+                    buf.push_str(&String::from_utf8_lossy(&chunk));
+
+                    // Process complete SSE lines
+                    while let Some(newline_pos) = buf.find('\n') {
+                        let line = buf[..newline_pos].trim().to_string();
+                        buf.drain(..newline_pos + 1);
+
+                        if let Some(data) = line.strip_prefix("data: ") {
+                            if data == "[DONE]" {
+                                break;
+                            }
+                            if let Ok(parsed) = serde_json::from_str::<ChatChunk>(data) {
+                                if let Some(choice) = parsed.choices.first() {
+                                    if let Some(token) = &choice.delta.content {
+                                        if !token.is_empty() {
+                                            let output = self.process_token(token);
+                                            if !output.is_empty() {
+                                                print!("{output}");
+                                                full_response.push_str(&output);
+                                                io::stdout().flush()?;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }

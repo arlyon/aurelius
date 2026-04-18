@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use async_trait::async_trait;
 use candle_core::{DType, Device, IndexOp, Tensor};
 use fastembed::{Qwen3Config, Qwen3Model};
@@ -20,6 +21,11 @@ pub enum Model {
     Full(Qwen3Model),
     Quantized(Session),
     Ollama(swiftide::integrations::ollama::Ollama),
+    Lemonade {
+        client: reqwest::Client,
+        base_url: String,
+        model: String,
+    },
 }
 
 pub struct Embedder {
@@ -56,7 +62,7 @@ fn build_attention_mask_4d(mask: &Tensor) -> candle_core::Result<Tensor> {
 }
 
 impl Embedder {
-    pub async fn new(quantized: bool, ollama: bool) -> Result<Self> {
+    pub async fn new(quantized: bool, ollama: bool, lemonade: Option<(&str, &str)>) -> Result<Self> {
         let api = ApiBuilder::new().build()?;
 
         let device = if candle_core::utils::cuda_is_available() {
@@ -70,7 +76,14 @@ impl Embedder {
         let mut tokenizer = Tokenizer::from_file(tokenizer_file).map_err(anyhow::Error::msg)?;
         tokenizer.with_padding(Some(tokenizers::PaddingParams::default()));
 
-        let model = if ollama {
+        let model = if let Some((base_url, embed_model)) = lemonade {
+            info!("Initializing Lemonade embeddings (model: {embed_model}, url: {base_url})...");
+            Model::Lemonade {
+                client: reqwest::Client::new(),
+                base_url: base_url.to_string(),
+                model: embed_model.to_string(),
+            }
+        } else if ollama {
             if !quantized {
                 anyhow::bail!("ollama + non-quantized is not supported right now");
             }
@@ -170,6 +183,71 @@ impl EmbeddingModel for Embedder {
                     batch_size, duration, tok_per_sec
                 );
                 result
+            }
+            Model::Lemonade { client, base_url, model } => {
+                info!(
+                    "Submitting batch of {} chunks (~{} tokens) to Lemonade",
+                    batch_size, total_tokens
+                );
+
+                #[derive(Serialize)]
+                struct EmbedRequest<'a> {
+                    model: &'a str,
+                    input: &'a [String],
+                }
+
+                #[derive(Deserialize)]
+                struct EmbedData {
+                    embedding: Vec<f32>,
+                }
+
+                #[derive(Deserialize)]
+                struct EmbedResponse {
+                    data: Vec<EmbedData>,
+                }
+
+                let url = format!("{}/api/v1/embeddings", base_url);
+                let resp = client
+                    .post(&url)
+                    .json(&EmbedRequest { model, input: &input })
+                    .send()
+                    .await
+                    .map_err(|e| LanguageModelError::permanent(e.to_string()))?;
+
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(LanguageModelError::permanent(format!(
+                        "Lemonade embeddings error {status}: {body}"
+                    )));
+                }
+
+                let embed_resp: EmbedResponse = resp
+                    .json()
+                    .await
+                    .map_err(|e| LanguageModelError::permanent(e.to_string()))?;
+
+                let duration = start.elapsed();
+                let tok_per_sec = if duration.as_secs_f64() > 0.0 {
+                    total_tokens as f64 / duration.as_secs_f64()
+                } else {
+                    0.0
+                };
+                info!(
+                    "Lemonade embedding complete: {} chunks in {:.2?} ({:.2} tok/s)",
+                    batch_size, duration, tok_per_sec
+                );
+
+                let embeddings: Vec<Vec<f32>> = embed_resp.data.into_iter().map(|d| d.embedding).collect();
+                // Sort by original order (Lemonade returns in order, but be safe)
+                if embeddings.len() != batch_size {
+                    return Err(LanguageModelError::permanent(format!(
+                        "Lemonade returned {} embeddings for {} inputs",
+                        embeddings.len(),
+                        batch_size
+                    )));
+                }
+                Ok(embeddings)
             }
             Model::Full(model) => {
                 info!(

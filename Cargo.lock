@@ -863,6 +863,7 @@ dependencies = [
  "ignore",
  "kreuzberg",
  "lance-graph",
+ "lance-index 2.0.0",
  "lancedb",
  "mime_guess",
  "ndarray 0.17.2",
