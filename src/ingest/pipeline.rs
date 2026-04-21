@@ -5,16 +5,16 @@ use async_trait::async_trait;
 use blake3;
 use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use kreuzberg::{ChunkerType, ChunkingConfig, ExtractionConfig, extract_file};
 use lancedb::index::scalar::FtsIndexBuilder;
 use lancedb::query::{ExecutableQuery, QueryBase};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use swiftide::indexing::{self, IndexingStream, Node};
 use swiftide::integrations::lancedb::LanceDB;
 use swiftide::traits::{EmbeddingModel, Loader, NodeCache, Transformer, WithIndexingDefaults};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use std::collections::HashSet;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use uuid;
@@ -330,7 +330,6 @@ impl Transformer for ContextPrependTransformer {
     }
 }
 
-
 #[derive(Clone, Debug)]
 struct Cache {
     cache_table: lancedb::table::Table,
@@ -631,12 +630,7 @@ pub async fn run_ingest(
     let pb_chunked = multi.add(create_progress_bar(0, "Chunking"));
     let pb_ingested = multi.add(create_progress_bar(0, "Ingesting"));
 
-    let loader = GitignoreLoader::new(
-        path,
-        pb_discovered,
-        pb_chunked.clone(),
-        pb_ingested.clone(),
-    );
+    let loader = GitignoreLoader::new(path, pb_discovered, pb_chunked.clone(), pb_ingested.clone());
 
     indexing::Pipeline::from_loader(loader)
         .with_concurrency(1)

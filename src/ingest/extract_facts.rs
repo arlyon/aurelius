@@ -8,9 +8,7 @@ use swiftide::traits::ChatCompletion;
 use tracing::debug;
 use tracing::info;
 
-use crate::metabolic::facts::{
-    get_or_create_facts_table, write_facts, Extractor,
-};
+use crate::metabolic::facts::{Extractor, get_or_create_facts_table, write_facts};
 
 fn create_progress_bar(len: u64, message: &str) -> ProgressBar {
     let pb = ProgressBar::new(len);
@@ -70,7 +68,11 @@ pub async fn run_extract_facts(completion: &dyn ChatCompletion) -> Result<()> {
     // Scan chunks for unique (context_window_id, parent_block) pairs not yet analyzed
     let batches = chunks_table
         .query()
-        .select(Select::columns(&["context_window_id", "parent_block", "path"]))
+        .select(Select::columns(&[
+            "context_window_id",
+            "parent_block",
+            "path",
+        ]))
         .execute()
         .await?
         .try_collect::<Vec<_>>()
@@ -169,8 +171,7 @@ pub async fn run_extract_facts(completion: &dyn ChatCompletion) -> Result<()> {
 
     info!(
         "Fact extraction complete: {} facts across {} files",
-        total_facts,
-        total_unanalyzed
+        total_facts, total_unanalyzed
     );
     Ok(())
 }

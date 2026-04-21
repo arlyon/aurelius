@@ -3,8 +3,8 @@
 mod cli;
 mod ingest;
 mod metabolic;
-mod query;
 mod persistence;
+mod query;
 
 use anyhow::Result;
 use clap::Parser;

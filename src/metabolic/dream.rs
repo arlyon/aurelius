@@ -10,9 +10,9 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::metabolic::facts::{
-    delete_all_facts, get_or_create_evicted_facts_table, get_or_create_facts_table,
-    is_functional_predicate, load_all_facts, resolve_contradiction, synthesize_neuron, write_facts,
-    ContradictionResolution, Fact,
+    ContradictionResolution, Fact, delete_all_facts, get_or_create_evicted_facts_table,
+    get_or_create_facts_table, is_functional_predicate, load_all_facts, resolve_contradiction,
+    synthesize_neuron, write_facts,
 };
 use crate::metabolic::social_graph::run_social_graph;
 

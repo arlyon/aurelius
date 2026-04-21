@@ -5,8 +5,8 @@ use std::io::{self, Write};
 use swiftide::traits::ChatCompletion;
 
 use crate::metabolic::facts::{
-    Fact, delete_facts_by_ids, get_or_create_facts_table, load_all_facts, write_facts, Extractor,
-    is_functional_predicate,
+    Extractor, Fact, delete_facts_by_ids, get_or_create_facts_table, is_functional_predicate,
+    load_all_facts, write_facts,
 };
 
 pub async fn run_teach(

@@ -7,7 +7,10 @@ pub fn db_path() -> String {
         if !data_dir.exists() {
             std::fs::create_dir_all(data_dir).expect("Failed to create data directory");
         }
-        data_dir.to_str().expect("Path is not valid UTF-8").to_string()
+        data_dir
+            .to_str()
+            .expect("Path is not valid UTF-8")
+            .to_string()
     } else {
         "aurelius_db".to_string()
     }

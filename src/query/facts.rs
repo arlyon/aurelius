@@ -1,10 +1,10 @@
+use crate::metabolic::facts::Fact;
 use anyhow::Result;
 use arrow_array::{Array, RecordBatch, StringArray};
 use futures::{StreamExt, TryStreamExt};
 use lancedb::connect;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use std::collections::HashMap;
-use crate::metabolic::facts::Fact;
 pub async fn run_facts(
     subject: Option<String>,
     predicate: Option<String>,
@@ -54,11 +54,19 @@ pub async fn run_facts(
         // Find matching chunk IDs first
         let chunks_table = db.open_table("chunks").execute().await?;
         let filter = format!("path LIKE '%{}%'", s.replace('\'', "''"));
-        let mut stream = chunks_table.query().only_if(filter).select(lancedb::query::Select::columns(&["context_window_id"])).execute().await?;
+        let mut stream = chunks_table
+            .query()
+            .only_if(filter)
+            .select(lancedb::query::Select::columns(&["context_window_id"]))
+            .execute()
+            .await?;
         let mut matching_cwids = std::collections::HashSet::new();
         while let Some(batch_result) = stream.next().await {
             let batch = batch_result?;
-            if let Some(col) = batch.column_by_name("context_window_id").and_then(|c| c.as_any().downcast_ref::<StringArray>()) {
+            if let Some(col) = batch
+                .column_by_name("context_window_id")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            {
                 for i in 0..col.len() {
                     if !col.is_null(i) {
                         matching_cwids.insert(col.value(i).to_string());
@@ -66,7 +74,7 @@ pub async fn run_facts(
                 }
             }
         }
-        
+
         if matching_cwids.is_empty() {
             if json {
                 println!("[]");
@@ -75,8 +83,12 @@ pub async fn run_facts(
             }
             return Ok(());
         }
-        
-        let id_list = matching_cwids.into_iter().map(|id| format!("'{}'", id.replace('\'', "''"))).collect::<Vec<_>>().join(", ");
+
+        let id_list = matching_cwids
+            .into_iter()
+            .map(|id| format!("'{}'", id.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(", ");
         filters.push(format!("chunk_id IN ({})", id_list));
     }
 
@@ -89,11 +101,19 @@ pub async fn run_facts(
     // but for now we fetch all matching facts and sort them.
     // If limit is provided, we still fetch all to ensure correct global sorting.
 
-    let batches = query_builder.execute().await?.try_collect::<Vec<RecordBatch>>().await?;
+    let batches = query_builder
+        .execute()
+        .await?
+        .try_collect::<Vec<RecordBatch>>()
+        .await?;
     let mut facts = extract_facts_from_batches(&batches);
 
     if sort == "confidence" {
-        facts.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+        facts.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
     } else {
         facts.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     }
@@ -188,7 +208,10 @@ fn extract_facts_from_batches(batches: &[RecordBatch]) -> Vec<Fact> {
     facts
 }
 
-async fn fetch_sources(db: &lancedb::Connection, facts: &[Fact]) -> Result<HashMap<String, String>> {
+async fn fetch_sources(
+    db: &lancedb::Connection,
+    facts: &[Fact],
+) -> Result<HashMap<String, String>> {
     let mut sources = HashMap::new();
     let chunk_ids: Vec<String> = facts.iter().map(|f| f.chunk_id.clone()).collect();
     if chunk_ids.is_empty() {
@@ -196,7 +219,7 @@ async fn fetch_sources(db: &lancedb::Connection, facts: &[Fact]) -> Result<HashM
     }
 
     let chunks_table = db.open_table("chunks").execute().await?;
-    
+
     // Process in chunks to avoid too large filter string
     for chunk_group in chunk_ids.chunks(100) {
         let id_list = chunk_group
@@ -237,7 +260,7 @@ fn display_stats(facts: &[Fact]) {
 
     let total = facts.len();
     let avg_confidence: f32 = facts.iter().map(|f| f.confidence).sum::<f32>() / total as f32;
-    
+
     let mut subject_counts = HashMap::new();
     for f in facts {
         *subject_counts.entry(&f.subject).or_insert(0) += 1;
@@ -276,7 +299,10 @@ fn display_table(facts: &[Fact], sources: &HashMap<String, String>) {
         pred_w = pred_w.max(f.predicate.len());
         obj_w = obj_w.max(f.object.len());
         if !sources.is_empty() {
-            let src = sources.get(&f.chunk_id).map(|s| s.as_str()).unwrap_or("[Core Truth]");
+            let src = sources
+                .get(&f.chunk_id)
+                .map(|s| s.as_str())
+                .unwrap_or("[Core Truth]");
             src_w = src_w.max(src.len());
         }
     }
@@ -285,14 +311,32 @@ fn display_table(facts: &[Fact], sources: &HashMap<String, String>) {
     let header = if sources.is_empty() {
         format!(
             "| {:<id_w$} | {:<sub_w$} | {:<pred_w$} | {:<obj_w$} | {:<conf_w$} |",
-            "ID", "Subject", "Predicate", "Object", "Conf",
-            id_w = id_w, sub_w = sub_w, pred_w = pred_w, obj_w = obj_w, conf_w = conf_w
+            "ID",
+            "Subject",
+            "Predicate",
+            "Object",
+            "Conf",
+            id_w = id_w,
+            sub_w = sub_w,
+            pred_w = pred_w,
+            obj_w = obj_w,
+            conf_w = conf_w
         )
     } else {
         format!(
             "| {:<id_w$} | {:<sub_w$} | {:<pred_w$} | {:<obj_w$} | {:<conf_w$} | {:<src_w$} |",
-            "ID", "Subject", "Predicate", "Object", "Conf", "Source",
-            id_w = id_w, sub_w = sub_w, pred_w = pred_w, obj_w = obj_w, conf_w = conf_w, src_w = src_w
+            "ID",
+            "Subject",
+            "Predicate",
+            "Object",
+            "Conf",
+            "Source",
+            id_w = id_w,
+            sub_w = sub_w,
+            pred_w = pred_w,
+            obj_w = obj_w,
+            conf_w = conf_w,
+            src_w = src_w
         )
     };
     println!("{}", header);
@@ -302,7 +346,7 @@ fn display_table(facts: &[Fact], sources: &HashMap<String, String>) {
     for f in facts {
         let id_short = &f.id[..4.min(f.id.len())];
         let conf_str = format!("{:.2}", f.confidence);
-        
+
         let conf_colored = if f.confidence >= 0.8 {
             conf_str.with(Color::Green)
         } else if f.confidence >= 0.4 {
@@ -310,15 +354,36 @@ fn display_table(facts: &[Fact], sources: &HashMap<String, String>) {
         } else {
             conf_str.with(Color::Red)
         };
-        
+
         if sources.is_empty() {
-            print!("| {:<id_w$} | {:<sub_w$} | {:<pred_w$} | {:<obj_w$} | ",
-                id_short, f.subject, f.predicate, f.object, id_w = id_w, sub_w = sub_w, pred_w = pred_w, obj_w = obj_w);
+            print!(
+                "| {:<id_w$} | {:<sub_w$} | {:<pred_w$} | {:<obj_w$} | ",
+                id_short,
+                f.subject,
+                f.predicate,
+                f.object,
+                id_w = id_w,
+                sub_w = sub_w,
+                pred_w = pred_w,
+                obj_w = obj_w
+            );
             println!("{:>conf_w$} |", conf_colored, conf_w = conf_w);
         } else {
-            let src = sources.get(&f.chunk_id).map(|s| s.as_str()).unwrap_or("[Core Truth]");
-            print!("| {:<id_w$} | {:<sub_w$} | {:<pred_w$} | {:<obj_w$} | ",
-                id_short, f.subject, f.predicate, f.object, id_w = id_w, sub_w = sub_w, pred_w = pred_w, obj_w = obj_w);
+            let src = sources
+                .get(&f.chunk_id)
+                .map(|s| s.as_str())
+                .unwrap_or("[Core Truth]");
+            print!(
+                "| {:<id_w$} | {:<sub_w$} | {:<pred_w$} | {:<obj_w$} | ",
+                id_short,
+                f.subject,
+                f.predicate,
+                f.object,
+                id_w = id_w,
+                sub_w = sub_w,
+                pred_w = pred_w,
+                obj_w = obj_w
+            );
             print!("{:>conf_w$} | ", conf_colored, conf_w = conf_w);
             println!("{:<src_w$} |", src, src_w = src_w);
         }
