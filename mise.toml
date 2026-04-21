@@ -1,3 +1,4 @@
 [tools]
+"cargo:cargo-dist" = "latest"
 "cargo:quantize-rs" = "latest"
 python = "3.11"
