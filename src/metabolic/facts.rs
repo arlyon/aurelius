@@ -415,10 +415,10 @@ Text:
 }
 
 pub fn extract_json_array(s: &str) -> String {
-    if let (Some(start), Some(end)) = (s.find('['), s.rfind(']')) {
-        if start <= end {
-            return s[start..=end].to_string();
-        }
+    if let (Some(start), Some(end)) = (s.find('['), s.rfind(']'))
+        && start <= end
+    {
+        return s[start..=end].to_string();
     }
     "[]".to_string()
 }

@@ -5,6 +5,7 @@ use futures::{StreamExt, TryStreamExt};
 use lancedb::connect;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use std::collections::HashMap;
+
 pub async fn run_facts(
     subject: Option<String>,
     predicate: Option<String>,

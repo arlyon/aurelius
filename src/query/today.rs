@@ -384,12 +384,11 @@ pub async fn run_today() -> Result<()> {
             Duration::from_millis(16)
         };
 
-        if event::poll(poll_timeout)? {
-            if let Event::Key(key) = event::read()? {
-                if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
-                    break;
-                }
-            }
+        if event::poll(poll_timeout)?
+            && let Event::Key(key) = event::read()?
+            && matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+        {
+            break;
         }
     }
 

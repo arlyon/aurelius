@@ -236,35 +236,35 @@ impl swiftide::traits::ChunkerTransformer for KreuzbergTransformer {
                     }
                 }
 
-                if let Some(chunks) = result.chunks {
-                    if !chunks.is_empty() {
-                        let mut nodes = Vec::new();
-                        for (i, chunk) in chunks.into_iter().enumerate() {
-                            let mut chunk_node = node.clone();
-                            chunk_node.chunk = chunk.content;
+                if let Some(chunks) = result.chunks
+                    && !chunks.is_empty()
+                {
+                    let mut nodes = Vec::new();
+                    for (i, chunk) in chunks.into_iter().enumerate() {
+                        let mut chunk_node = node.clone();
+                        chunk_node.chunk = chunk.content;
+                        chunk_node
+                            .metadata
+                            .insert("chunk_index".to_string(), i as i64);
+                        chunk_node
+                            .metadata
+                            .insert("chunked_by".to_string(), "kreuzberg".to_string());
+
+                        if let Some(hc) = chunk.metadata.heading_context {
+                            let breadcrumbs = hc
+                                .headings
+                                .iter()
+                                .map(|h| h.text.clone())
+                                .collect::<Vec<_>>()
+                                .join(" > ");
                             chunk_node
                                 .metadata
-                                .insert("chunk_index".to_string(), i as i64);
-                            chunk_node
-                                .metadata
-                                .insert("chunked_by".to_string(), "kreuzberg".to_string());
-
-                            if let Some(hc) = chunk.metadata.heading_context {
-                                let breadcrumbs = hc
-                                    .headings
-                                    .iter()
-                                    .map(|h| h.text.clone())
-                                    .collect::<Vec<_>>()
-                                    .join(" > ");
-                                chunk_node
-                                    .metadata
-                                    .insert("heading_context".to_string(), breadcrumbs);
-                            }
-
-                            nodes.push(chunk_node);
+                                .insert("heading_context".to_string(), breadcrumbs);
                         }
-                        return IndexingStream::from_nodes(nodes);
+
+                        nodes.push(chunk_node);
                     }
+                    return IndexingStream::from_nodes(nodes);
                 }
 
                 // Fallback: use the whole content and let the next pipeline step handle it
@@ -405,12 +405,11 @@ impl NodeCache for Cache {
 
         if let (Some(path), Some(hash)) = (path, hash) {
             let query = format!("path = '{}' AND hash = '{}'", path, hash);
-            if let Ok(result) = self.cache_table.query().only_if(query).execute().await {
-                if let Ok(batches) = result.try_collect::<Vec<arrow_array::RecordBatch>>().await {
-                    if batches.iter().any(|b| b.num_rows() > 0) {
-                        return true;
-                    }
-                }
+            if let Ok(result) = self.cache_table.query().only_if(query).execute().await
+                && let Ok(batches) = result.try_collect::<Vec<arrow_array::RecordBatch>>().await
+                && batches.iter().any(|b| b.num_rows() > 0)
+            {
+                return true;
             }
 
             // If we are here, the file is either new or modified.

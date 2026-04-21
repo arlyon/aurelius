@@ -306,17 +306,16 @@ pub async fn run_dream(dry_run: bool, yes: bool, completion: &dyn ChatCompletion
     // ---- Calendar Events (High-EQ) ----
     let mut high_eq_events: Vec<(String, String, String, i64)> = Vec::new();
     for fact in &final_extracted {
-        if fact.predicate == "born_on" || fact.predicate == "life_event" {
-            if let Some(days) = parse_days_until(&fact.object) {
-                if days >= 0 && days <= 14 {
-                    high_eq_events.push((
-                        fact.subject.clone(),
-                        fact.predicate.clone(),
-                        fact.object.clone(),
-                        days,
-                    ));
-                }
-            }
+        if (fact.predicate == "born_on" || fact.predicate == "life_event")
+            && let Some(days) = parse_days_until(&fact.object)
+            && (0..=14).contains(&days)
+        {
+            high_eq_events.push((
+                fact.subject.clone(),
+                fact.predicate.clone(),
+                fact.object.clone(),
+                days,
+            ));
         }
     }
     high_eq_events.sort_by_key(|(_, _, _, d)| *d);

@@ -1,3 +1,5 @@
+#![allow(clippy::clone_on_copy)]
+
 use ascent::ascent;
 use chrono::Utc;
 
@@ -95,17 +97,9 @@ pub fn run_social_graph(facts: &[Fact]) -> SocialGraphResults {
 
     SocialGraphResults {
         hold_communications: prog.hold_communications.into_iter().map(|(p,)| p).collect(),
-        blocked_actions: prog
-            .blocked_action
-            .into_iter()
-            .map(|(a, c, i)| (a, c, i))
-            .collect(),
-        social_trust: prog
-            .social_trust
-            .into_iter()
-            .map(|(a, b, t)| (a, b, t))
-            .collect(),
-        spouse_of: prog.spouse_of.into_iter().map(|(a, b)| (a, b)).collect(),
-        child_of: prog.child_of.into_iter().map(|(a, b)| (a, b)).collect(),
+        blocked_actions: prog.blocked_action.into_iter().collect(),
+        social_trust: prog.social_trust.into_iter().collect(),
+        spouse_of: prog.spouse_of.into_iter().collect(),
+        child_of: prog.child_of.into_iter().collect(),
     }
 }

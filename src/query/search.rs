@@ -99,7 +99,7 @@ pub async fn run_search(
     query: String,
     embedder: &impl EmbeddingModel,
     completion: &impl ChatCompletion,
-    thinking: bool,
+    _thinking: bool,
 ) -> Result<()> {
     println!("pulling from memory...");
 
