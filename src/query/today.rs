@@ -53,7 +53,7 @@ struct Pulse {
     blocked: Vec<(String, String, String)>,
 }
 
-fn load_pulse(path: &str) -> Result<Pulse> {
+fn load_pulse(path: impl AsRef<std::path::Path>) -> Result<Pulse> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     let mut pulse = Pulse {
@@ -304,13 +304,13 @@ fn render_health(pulse: &Pulse, visible: bool) -> Paragraph<'static> {
 }
 
 pub async fn run_today() -> Result<()> {
-    let path = "aurelius_db/morning_pulse.ldjson";
-    if !std::path::Path::new(path).exists() {
+    let path = crate::persistence::morning_pulse_path();
+    if !path.exists() {
         println!("No morning pulse found. Run `aurelius dream` first.");
         return Ok(());
     }
 
-    let pulse = load_pulse(path)?;
+    let pulse = load_pulse(&path)?;
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();

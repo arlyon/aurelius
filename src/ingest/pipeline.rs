@@ -13,17 +13,86 @@ use std::sync::Arc;
 use swiftide::indexing::{self, IndexingStream, Node};
 use swiftide::integrations::lancedb::LanceDB;
 use swiftide::traits::{EmbeddingModel, Loader, NodeCache, Transformer, WithIndexingDefaults};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use std::collections::HashSet;
+use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use uuid;
 
-#[derive(Clone, Default, Debug)]
+fn create_progress_bar(len: u64, message: &str) -> ProgressBar {
+    let pb = ProgressBar::new(len);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{msg:>12} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+    pb.set_message(message.to_string());
+    pb
+}
+
+#[derive(Clone)]
+pub struct StatusTransformer {
+    pub action: String,
+    pub pb: ProgressBar,
+    pub seen: Arc<Mutex<HashSet<String>>>,
+}
+
+impl StatusTransformer {
+    pub fn new(action: &str, pb: ProgressBar) -> Self {
+        Self {
+            action: action.to_string(),
+            pb,
+            seen: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+}
+
+impl WithIndexingDefaults for StatusTransformer {}
+
+#[async_trait]
+impl Transformer for StatusTransformer {
+    type Input = String;
+    type Output = String;
+
+    async fn transform_node(&self, node: Node<Self::Input>) -> Result<Node<Self::Output>> {
+        let path = node
+            .metadata
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let mut seen = self.seen.lock().await;
+        if seen.insert(path.to_string()) {
+            self.pb.suspend(|| {
+                eprintln!("{}: {}", path, self.action);
+            });
+            self.pb.inc(1);
+        }
+        Ok(node)
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct GitignoreLoader {
     path: Vec<PathBuf>,
+    pb_discovered: ProgressBar,
+    pb_chunked: ProgressBar,
+    pb_ingested: ProgressBar,
 }
 
 impl GitignoreLoader {
-    pub fn new(path: Vec<PathBuf>) -> Self {
-        Self { path }
+    pub fn new(
+        path: Vec<PathBuf>,
+        pb_discovered: ProgressBar,
+        pb_chunked: ProgressBar,
+        pb_ingested: ProgressBar,
+    ) -> Self {
+        Self {
+            path,
+            pb_discovered,
+            pb_chunked,
+            pb_ingested,
+        }
     }
 }
 
@@ -32,32 +101,44 @@ impl Loader for GitignoreLoader {
     type Output = String;
 
     fn into_stream(self) -> IndexingStream<Self::Output> {
-        let nodes = self
+        let all_files: Vec<PathBuf> = self
             .path
+            .iter()
+            .flat_map(|p| crate::ingest::walker::walk_directory(p.clone()))
+            .collect();
+
+        let total_files = all_files.len() as u64;
+        self.pb_discovered.set_length(total_files);
+        self.pb_chunked.set_length(total_files);
+        self.pb_ingested.set_length(total_files);
+
+        let nodes = all_files
             .into_iter()
-            .flat_map(|p| {
-                let files = crate::ingest::walker::walk_directory(p);
-                files.into_iter().filter_map(|p| {
-                    let path_str = p.to_string_lossy().to_string();
+            .filter_map(|p| {
+                let path_str = p.to_string_lossy().to_string();
 
-                    // Hash the file for caching
-                    let hash = match std::fs::read(&p) {
-                        Ok(bytes) => {
-                            let h = blake3::hash(&bytes).to_hex().to_string();
-                            debug!("Hashed file {:?}: {}", p, h);
-                            h
-                        }
-                        Err(e) => {
-                            warn!("Failed to read file for hashing at {:?}: {}", p, e);
-                            return None;
-                        }
-                    };
+                // Hash the file for caching
+                let hash = match std::fs::read(&p) {
+                    Ok(bytes) => {
+                        let h = blake3::hash(&bytes).to_hex().to_string();
+                        debug!("Hashed file {:?}: {}", p, h);
+                        h
+                    }
+                    Err(e) => {
+                        warn!("Failed to read file for hashing at {:?}: {}", p, e);
+                        return None;
+                    }
+                };
 
-                    let mut node = Node::<String>::new("".to_string());
-                    node.metadata.insert("path".to_string(), path_str);
-                    node.metadata.insert("hash".to_string(), hash);
-                    Some(node)
-                })
+                self.pb_discovered.suspend(|| {
+                    eprintln!("{}: discovered", path_str);
+                });
+                self.pb_discovered.inc(1);
+
+                let mut node = Node::<String>::new("".to_string());
+                node.metadata.insert("path".to_string(), path_str);
+                node.metadata.insert("hash".to_string(), hash);
+                Some(node)
             })
             .collect();
 
@@ -249,26 +330,6 @@ impl Transformer for ContextPrependTransformer {
     }
 }
 
-#[derive(Clone, Default)]
-pub struct LogTransformer;
-
-impl WithIndexingDefaults for LogTransformer {}
-
-#[async_trait]
-impl Transformer for LogTransformer {
-    type Input = String;
-    type Output = String;
-
-    async fn transform_node(&self, node: Node<Self::Input>) -> Result<Node<Self::Output>> {
-        let path = node
-            .metadata
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        info!("Processing file: {}", path);
-        Ok(node)
-    }
-}
 
 #[derive(Clone, Debug)]
 struct Cache {
@@ -458,8 +519,8 @@ pub async fn run_ingest(
 ) -> Result<()> {
     info!("Starting ingestion for {:?}", path);
 
-    let db_path = "aurelius_db";
-    let db = lancedb::connect(db_path).execute().await?;
+    let db_path = crate::persistence::db_path();
+    let db = lancedb::connect(&db_path).execute().await?;
 
     let table_name = "chunks";
     let chunks_schema = Arc::new(arrow_schema::Schema::new(vec![
@@ -549,7 +610,7 @@ pub async fn run_ingest(
     }
 
     let lancedb = LanceDB::builder()
-        .uri(db_path)
+        .uri(&db_path)
         .table_name(table_name)
         .vector_size(2560) // zembed-1 dimension
         .with_vector(indexing::EmbeddedField::Combined)
@@ -565,18 +626,29 @@ pub async fn run_ingest(
         .with_metadata("parent_block")
         .build()?;
 
-    let loader = GitignoreLoader::new(path);
+    let multi = MultiProgress::new();
+    let pb_discovered = multi.add(create_progress_bar(0, "Discovering"));
+    let pb_chunked = multi.add(create_progress_bar(0, "Chunking"));
+    let pb_ingested = multi.add(create_progress_bar(0, "Ingesting"));
+
+    let loader = GitignoreLoader::new(
+        path,
+        pb_discovered,
+        pb_chunked.clone(),
+        pb_ingested.clone(),
+    );
 
     indexing::Pipeline::from_loader(loader)
         .with_concurrency(1)
         .filter_cached(cache)
         .then_chunk(KreuzbergTransformer::default())
-        .then(LogTransformer::default())
+        .then(StatusTransformer::new("chunked", pb_chunked))
         .then_chunk(HierarchicalChunker::default())
         .filter(|node| node.as_ref().map(|n| !n.chunk.is_empty()).unwrap_or(false))
         .then(ContextPrependTransformer::default())
         .then_in_batch(indexing::transformers::Embed::new(embedder))
         .then_store_with(lancedb)
+        .then(StatusTransformer::new("ingested", pb_ingested))
         .run()
         .await?;
 

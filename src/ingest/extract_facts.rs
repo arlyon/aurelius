@@ -1,24 +1,32 @@
 use anyhow::Result;
 use arrow_array::Array;
-use chrono::Utc;
 use futures::TryStreamExt;
+use indicatif::{ProgressBar, ProgressStyle};
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
-use serde::Deserialize;
-use std::borrow::Cow;
-use std::collections::HashSet;
-use swiftide::chat_completion::{ChatCompletionRequest, ChatMessage};
+use std::collections::{HashMap, HashSet};
 use swiftide::traits::ChatCompletion;
-use tracing::{debug, warn};
-use tracing::{info, trace};
-use uuid::Uuid;
+use tracing::debug;
+use tracing::info;
 
-use crate::metabolic::facts::Fact;
+use crate::metabolic::facts::{
+    get_or_create_facts_table, write_facts, Extractor,
+};
 
-use crate::metabolic::facts::{get_or_create_facts_table, write_facts};
+fn create_progress_bar(len: u64, message: &str) -> ProgressBar {
+    let pb = ProgressBar::new(len);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{msg:>12} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+    pb.set_message(message.to_string());
+    pb
+}
 
-pub async fn run_extract_facts(completion: &impl ChatCompletion) -> Result<()> {
-    let db_path = "aurelius_db";
-    let db = lancedb::connect(db_path).execute().await?;
+pub async fn run_extract_facts(completion: &dyn ChatCompletion) -> Result<()> {
+    let db_path = crate::persistence::db_path();
+    let db = lancedb::connect(&db_path).execute().await?;
 
     let chunks_table = db
         .open_table("chunks")
@@ -62,14 +70,14 @@ pub async fn run_extract_facts(completion: &impl ChatCompletion) -> Result<()> {
     // Scan chunks for unique (context_window_id, parent_block) pairs not yet analyzed
     let batches = chunks_table
         .query()
-        .select(Select::columns(&["context_window_id", "parent_block"]))
+        .select(Select::columns(&["context_window_id", "parent_block", "path"]))
         .execute()
         .await?
         .try_collect::<Vec<_>>()
         .await?;
 
     let mut seen = HashSet::<String>::new();
-    let mut unanalyzed: Vec<(String, String)> = Vec::new();
+    let mut grouped_unanalyzed: HashMap<String, Vec<(String, String)>> = HashMap::new();
 
     for batch in &batches {
         let Some(cwid_col) = batch.column_by_name("context_window_id") else {
@@ -78,164 +86,93 @@ pub async fn run_extract_facts(completion: &impl ChatCompletion) -> Result<()> {
         let Some(pb_col) = batch.column_by_name("parent_block") else {
             continue;
         };
+        let Some(path_col) = batch.column_by_name("path") else {
+            continue;
+        };
         let Some(cwid_arr) = cwid_col.as_any().downcast_ref::<arrow_array::StringArray>() else {
             continue;
         };
         let Some(pb_arr) = pb_col.as_any().downcast_ref::<arrow_array::StringArray>() else {
             continue;
         };
+        let Some(path_arr) = path_col.as_any().downcast_ref::<arrow_array::StringArray>() else {
+            continue;
+        };
 
         for i in 0..cwid_arr.len() {
-            if cwid_arr.is_null(i) || pb_arr.is_null(i) {
+            if cwid_arr.is_null(i) || pb_arr.is_null(i) || path_arr.is_null(i) {
                 continue;
             }
             let cwid = cwid_arr.value(i).to_string();
             let parent = pb_arr.value(i).to_string();
+            let path = path_arr.value(i).to_string();
 
             if analyzed.contains(&cwid) || seen.contains(&cwid) {
                 continue;
             }
             seen.insert(cwid.clone());
-            unanalyzed.push((cwid, parent));
+            grouped_unanalyzed
+                .entry(path)
+                .or_default()
+                .push((cwid, parent));
         }
     }
 
-    if unanalyzed.is_empty() {
+    if grouped_unanalyzed.is_empty() {
         info!("All chunks already analyzed — nothing to do");
         return Ok(());
     }
 
+    let total_unanalyzed: usize = grouped_unanalyzed.values().map(|v| v.len()).sum();
     info!(
-        "Extracting facts from {} unanalyzed context windows...",
-        unanalyzed.len()
+        "Extracting facts from {} unanalyzed context windows across {} files...",
+        total_unanalyzed,
+        grouped_unanalyzed.len()
     );
 
     let mut total_facts = 0usize;
     let extractor = Extractor { completion };
 
-    for (i, (context_window_id, parent_block)) in unanalyzed.iter().enumerate() {
-        match extractor
-            .extract_facts(parent_block, context_window_id)
-            .await
-        {
-            Ok(facts) => {
-                let n = facts.len();
-                if let Err(e) = write_facts(&facts_table, &facts).await {
-                    tracing::warn!("Failed to write facts for {}: {}", context_window_id, e);
-                } else {
-                    total_facts += n;
-                    info!(
-                        "[{}/{}] {} facts from context window {}",
-                        i + 1,
-                        unanalyzed.len(),
-                        n,
-                        &context_window_id[..8.min(context_window_id.len())]
-                    );
+    let pb = create_progress_bar(grouped_unanalyzed.len() as u64, "Facts");
+
+    for (path, chunks) in grouped_unanalyzed {
+        for (context_window_id, parent_block) in chunks {
+            match extractor
+                .extract_facts(&parent_block, &context_window_id)
+                .await
+            {
+                Ok(facts) => {
+                    let n = facts.len();
+                    if let Err(e) = write_facts(&facts_table, &facts).await {
+                        tracing::warn!("Failed to write facts for {}: {}", context_window_id, e);
+                    } else {
+                        total_facts += n;
+                        debug!(
+                            "Extracted {} facts from context window {}",
+                            n,
+                            &context_window_id[..8.min(context_window_id.len())]
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Qwen error for context window {}: {}", context_window_id, e)
                 }
             }
-            Err(e) => tracing::warn!("Qwen error for context window {}: {}", context_window_id, e),
         }
+        pb.suspend(|| {
+            eprintln!("{}: fact extracted", path);
+        });
+        pb.inc(1);
     }
+
+    pb.finish_and_clear();
 
     info!(
-        "Fact extraction complete: {} facts across {} context windows",
+        "Fact extraction complete: {} facts across {} files",
         total_facts,
-        unanalyzed.len()
+        total_unanalyzed
     );
     Ok(())
-}
-
-struct Extractor<'a> {
-    completion: &'a dyn ChatCompletion,
-}
-
-const FACT_PREDICATES: &str = "born_on, works_at, knows, spouse_of, parent_of, child_of, \
-    located_in, has_skill, member_of, owns, invested_in, life_event, \
-    social_trust, invoice_due, client_of, created_on, deadline_on";
-
-#[derive(Debug, Deserialize)]
-struct RawFact {
-    subject: String,
-    predicate: String,
-    object: String,
-    confidence: f32,
-}
-
-impl<'a> Extractor<'a> {
-    pub async fn extract_facts(&self, chunk: &str, chunk_id: &str) -> Result<Vec<Fact>> {
-        let prompt = format!(
-            r#"Extract atomic facts from the text below. Use ONLY these predicates: {predicates}
-
-Return ONLY a JSON array — no prose, no markdown fences:
-[{{"subject":"...","predicate":"...","object":"...","confidence":0.0}}]
-
-If no facts apply, return: []
-
-Text:
-{chunk}"#,
-            predicates = FACT_PREDICATES,
-            chunk = chunk,
-        );
-
-        debug!("Extracting facts from chunk (len={})", chunk.len());
-        trace!("Prompt: {}", &prompt);
-
-        let response = self
-            .completion
-            .complete(&ChatCompletionRequest {
-                messages: Cow::Borrowed(&[ChatMessage::System(prompt)]),
-                tools_spec: Default::default(),
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("Completion error: {}", e))?;
-
-        let full_response = response.message.unwrap_or_default();
-        debug!(
-            "Response (len={}): {:?}",
-            full_response.len(),
-            &full_response[..full_response.len().min(200)]
-        );
-
-        let json_str = extract_json_array(&full_response);
-
-        match serde_json::from_str::<Vec<RawFact>>(&json_str) {
-            Ok(raw_facts) => {
-                let now = Utc::now().timestamp_micros();
-                let facts = raw_facts
-                    .into_iter()
-                    .filter(|f| !f.subject.trim().is_empty() && !f.object.trim().is_empty())
-                    .map(|f| Fact {
-                        id: Uuid::new_v4().to_string(),
-                        chunk_id: chunk_id.to_string(),
-                        subject: f.subject,
-                        predicate: f.predicate,
-                        object: f.object,
-                        confidence: f.confidence.clamp(0.0, 1.0),
-                        is_core_truth: false,
-                        created_at: now,
-                    })
-                    .collect();
-                Ok(facts)
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to parse facts JSON: {} (raw: {:?})",
-                    e,
-                    &full_response[..full_response.len().min(300)]
-                );
-                Ok(vec![])
-            }
-        }
-    }
-}
-
-fn extract_json_array(s: &str) -> String {
-    if let (Some(start), Some(end)) = (s.find('['), s.rfind(']')) {
-        if start <= end {
-            return s[start..=end].to_string();
-        }
-    }
-    "[]".to_string()
 }
 
 #[cfg(test)]

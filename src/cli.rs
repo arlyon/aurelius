@@ -113,6 +113,10 @@ pub enum Commands {
         /// Print what would change without writing anything.
         #[arg(long)]
         dry_run: bool,
+
+        /// Apply changes automatically without prompting.
+        #[arg(short, long)]
+        yes: bool,
     },
 
     /// Interactively resolve contradictions in the facts table, locking in Core Truths.
@@ -120,6 +124,9 @@ pub enum Commands {
         /// Maximum number of contradiction pairs to surface (default: 10).
         #[arg(long, default_value_t = 10)]
         limit: usize,
+
+        /// An optional prompt to ad-hoc pull facts from.
+        prompt: Option<String>,
     },
 
     /// Display the morning pulse dashboard (run `aurelius dream` first).
@@ -127,4 +134,51 @@ pub enum Commands {
 
     /// List all ingested files in the database.
     Ls,
+
+    /// List and filter extracted facts from the knowledge graph.
+    Facts {
+        /// Filter by subject.
+        #[arg(long)]
+        subject: Option<String>,
+
+        /// Filter by predicate.
+        #[arg(long)]
+        predicate: Option<String>,
+
+        /// Filter by object.
+        #[arg(long)]
+        object: Option<String>,
+
+        /// Filter by source file path.
+        #[arg(long)]
+        source: Option<String>,
+
+        /// Show only "Core Truths" (confidence = 1.0).
+        #[arg(long)]
+        core_only: bool,
+
+        /// Show evicted facts instead of current ones.
+        #[arg(long)]
+        evicted: bool,
+
+        /// Sort by 'confidence' or 'date' (default: date).
+        #[arg(long, default_value = "date")]
+        sort: String,
+
+        /// Limit the number of facts displayed (default: 50).
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+
+        /// Output in JSON format.
+        #[arg(long)]
+        json: bool,
+
+        /// Display summary statistics instead of facts.
+        #[arg(long)]
+        stats: bool,
+
+        /// Show the source file path for each fact.
+        #[arg(long)]
+        show_source: bool,
+    },
 }

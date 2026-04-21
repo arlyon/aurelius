@@ -79,7 +79,7 @@ pub fn run_social_graph(facts: &[Fact]) -> SocialGraphResults {
                 prog.social_trust
                     .push((fact.subject.clone(), fact.object.clone(), milliunits));
             }
-            "life_event" | "born_on" => {
+            "life_event" => {
                 let days = (now_micros - fact.created_at) / (86_400 * 1_000_000);
                 prog.days_since_event
                     .push((fact.subject.clone(), fact.predicate.clone(), days));

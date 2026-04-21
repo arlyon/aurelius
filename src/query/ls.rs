@@ -7,9 +7,9 @@ use std::collections::BTreeMap;
 use tracing::{debug, info};
 
 pub async fn run_ls() -> Result<()> {
-    let db_path = "aurelius_db";
+    let db_path = crate::persistence::db_path();
     info!("Connecting to database at {} for listing files", db_path);
-    let db = connect(db_path).execute().await?;
+    let db = connect(&db_path).execute().await?;
     let table_name = "chunks";
 
     let table = match db.open_table(table_name).execute().await {

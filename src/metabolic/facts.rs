@@ -7,6 +7,7 @@ use lancedb::query::ExecutableQuery;
 use serde::{Deserialize, Serialize};
 use std::{borrow::Cow, sync::Arc};
 use swiftide::{chat_completion::ChatMessage, traits::ChatCompletion};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Fact {
@@ -39,6 +40,17 @@ pub fn facts_schema() -> Arc<arrow_schema::Schema> {
 
 pub async fn get_or_create_facts_table(db: &lancedb::Connection) -> Result<lancedb::table::Table> {
     let table_name = "facts";
+    let schema = facts_schema();
+    match db.open_table(table_name).execute().await {
+        Ok(t) => Ok(t),
+        Err(_) => Ok(db.create_empty_table(table_name, schema).execute().await?),
+    }
+}
+
+pub async fn get_or_create_evicted_facts_table(
+    db: &lancedb::Connection,
+) -> Result<lancedb::table::Table> {
+    let table_name = "evicted_facts";
     let schema = facts_schema();
     match db.open_table(table_name).execute().await {
         Ok(t) => Ok(t),
@@ -305,4 +317,108 @@ pub async fn synthesize_neuron(
     }
 
     Ok(None)
+}
+
+pub struct Extractor<'a> {
+    pub completion: &'a dyn ChatCompletion,
+}
+
+pub const FACT_PREDICATES: &str = "born_on, works_at, knows, spouse_of, parent_of, child_of, \
+    located_in, has_skill, member_of, owns, invested_in, life_event, \
+    social_trust, invoice_due, client_of, created_on, deadline_on";
+
+pub fn is_functional_predicate(predicate: &str) -> bool {
+    matches!(predicate, "born_on" | "created_on" | "deadline_on")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_functional_predicate() {
+        assert!(is_functional_predicate("born_on"));
+        assert!(is_functional_predicate("created_on"));
+        assert!(is_functional_predicate("deadline_on"));
+        assert!(!is_functional_predicate("works_at"));
+        assert!(!is_functional_predicate("child_of"));
+        assert!(!is_functional_predicate("client_of"));
+        assert!(!is_functional_predicate("located_in"));
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RawFact {
+    subject: String,
+    predicate: String,
+    object: String,
+    confidence: f32,
+}
+
+impl<'a> Extractor<'a> {
+    pub async fn extract_facts(&self, chunk: &str, chunk_id: &str) -> Result<Vec<Fact>> {
+        let prompt = format!(
+            r#"Extract atomic facts from the text below. Use ONLY these predicates: {predicates}
+
+Return ONLY a JSON array — no prose, no markdown fences:
+[{{"subject":"...","predicate":"...","object":"...","confidence":0.0}}]
+
+If no facts apply, return: []
+
+Text:
+{chunk}"#,
+            predicates = FACT_PREDICATES,
+            chunk = chunk,
+        );
+
+        let response = self
+            .completion
+            .complete(&swiftide::chat_completion::ChatCompletionRequest {
+                messages: Cow::Borrowed(&[ChatMessage::System(prompt)]),
+                tools_spec: Default::default(),
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("Completion error: {}", e))?;
+
+        let full_response = response.message.unwrap_or_default();
+        let json_str = extract_json_array(&full_response);
+
+        match serde_json::from_str::<Vec<RawFact>>(&json_str) {
+            Ok(raw_facts) => {
+                let now = Utc::now().timestamp_micros();
+                let facts = raw_facts
+                    .into_iter()
+                    .filter(|f| !f.subject.trim().is_empty() && !f.object.trim().is_empty())
+                    .map(|f| Fact {
+                        id: Uuid::new_v4().to_string(),
+                        chunk_id: chunk_id.to_string(),
+                        subject: f.subject,
+                        predicate: f.predicate,
+                        object: f.object,
+                        confidence: f.confidence.clamp(0.0, 1.0),
+                        is_core_truth: false,
+                        created_at: now,
+                    })
+                    .collect();
+                Ok(facts)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to parse facts JSON: {} (raw: {:?})",
+                    e,
+                    &full_response[..full_response.len().min(300)]
+                );
+                Ok(vec![])
+            }
+        }
+    }
+}
+
+pub fn extract_json_array(s: &str) -> String {
+    if let (Some(start), Some(end)) = (s.find('['), s.rfind(']')) {
+        if start <= end {
+            return s[start..=end].to_string();
+        }
+    }
+    "[]".to_string()
 }

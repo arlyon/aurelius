@@ -10,8 +10,9 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::metabolic::facts::{
-    ContradictionResolution, Fact, delete_all_facts, get_or_create_facts_table, load_all_facts,
-    resolve_contradiction, synthesize_neuron, write_facts,
+    delete_all_facts, get_or_create_evicted_facts_table, get_or_create_facts_table,
+    is_functional_predicate, load_all_facts, resolve_contradiction, synthesize_neuron, write_facts,
+    ContradictionResolution, Fact,
 };
 use crate::metabolic::social_graph::run_social_graph;
 
@@ -48,8 +49,10 @@ enum PulseLine {
     },
 }
 
-pub async fn run_dream(dry_run: bool, completion: &dyn ChatCompletion) -> Result<()> {
-    let db = lancedb::connect("aurelius_db").execute().await?;
+pub async fn run_dream(dry_run: bool, yes: bool, completion: &dyn ChatCompletion) -> Result<()> {
+    let db = lancedb::connect(&crate::persistence::db_path())
+        .execute()
+        .await?;
     let facts_table = get_or_create_facts_table(&db).await?;
 
     let all_facts = load_all_facts(&facts_table).await?;
@@ -104,6 +107,14 @@ pub async fn run_dream(dry_run: bool, completion: &dyn ChatCompletion) -> Result
 
     let mut contradiction_pairs: Vec<(usize, usize)> = Vec::new();
     for indices in groups.values() {
+        if indices.len() < 2 {
+            continue;
+        }
+        let predicate = &surviving[indices[0]].predicate;
+        if !is_functional_predicate(predicate) {
+            continue;
+        }
+
         for i in 0..indices.len() {
             for j in (i + 1)..indices.len() {
                 let a = &surviving[indices[i]];
@@ -190,6 +201,7 @@ pub async fn run_dream(dry_run: bool, completion: &dyn ChatCompletion) -> Result
     // ---- Phase B: Contradiction Resolution ----
     let mut contradictions_resolved = 0usize;
     let mut contradiction_loser_ids: HashSet<String> = HashSet::new();
+    let mut resolution_details = Vec::new();
 
     if !contradiction_pairs.is_empty() {
         for (ai, bi) in &contradiction_pairs {
@@ -198,9 +210,19 @@ pub async fn run_dream(dry_run: bool, completion: &dyn ChatCompletion) -> Result
             match resolve_contradiction(completion, fact_a, fact_b).await {
                 Ok(winner) => {
                     let loser_id = if winner == ContradictionResolution::A {
+                        resolution_details.push(format!(
+                            "Resolved contradiction for {} {}: kept '{}' over '{}'",
+                            fact_a.subject, fact_a.predicate, fact_a.object, fact_b.object
+                        ));
                         surviving[*bi].id.clone()
-                    } else {
+                    } else if winner == ContradictionResolution::B {
+                        resolution_details.push(format!(
+                            "Resolved contradiction for {} {}: kept '{}' over '{}'",
+                            fact_b.subject, fact_b.predicate, fact_b.object, fact_a.object
+                        ));
                         surviving[*ai].id.clone()
+                    } else {
+                        continue;
                     };
                     contradiction_loser_ids.insert(loser_id);
                     contradictions_resolved += 1;
@@ -233,6 +255,7 @@ pub async fn run_dream(dry_run: bool, completion: &dyn ChatCompletion) -> Result
     let mut neuron_facts: Vec<Fact> = Vec::new();
     let mut weak_ids_to_delete: HashSet<String> = HashSet::new();
     let mut neurons_merged = 0usize;
+    let mut neuron_details = Vec::new();
 
     if weak_by_subject.values().any(|v| v.len() >= 2) {
         for (subject, indices) in &weak_by_subject {
@@ -240,18 +263,22 @@ pub async fn run_dream(dry_run: bool, completion: &dyn ChatCompletion) -> Result
                 continue;
             }
             let cluster: Vec<&Fact> = indices.iter().map(|&i| &surviving[i]).collect();
-            match synthesize_neuron(&completion, subject, &cluster).await {
+            match synthesize_neuron(completion, subject, &cluster).await {
                 Ok(Some((predicate, object, confidence))) => {
                     neuron_facts.push(Fact {
                         id: Uuid::new_v4().to_string(),
                         chunk_id: "neuron".to_string(),
                         subject: subject.clone(),
-                        predicate,
-                        object,
+                        predicate: predicate.clone(),
+                        object: object.clone(),
                         confidence,
                         is_core_truth: false,
                         created_at: now_micros,
                     });
+                    neuron_details.push(format!(
+                        "Synthesized neuron for {}: {} {} (conf: {:.2})",
+                        subject, predicate, object, confidence
+                    ));
                     for &i in indices {
                         weak_ids_to_delete.insert(surviving[i].id.clone());
                     }
@@ -263,9 +290,22 @@ pub async fn run_dream(dry_run: bool, completion: &dyn ChatCompletion) -> Result
         }
     }
 
+    // ---- Build Final State ----
+    let all_delete_ids: HashSet<String> = contradiction_loser_ids
+        .iter()
+        .chain(weak_ids_to_delete.iter())
+        .cloned()
+        .collect();
+
+    let (final_extracted, evicted): (Vec<Fact>, Vec<Fact>) = surviving
+        .into_iter()
+        .partition(|f| !all_delete_ids.contains(&f.id));
+
+    let total_facts = final_extracted.len() + derived.len() + neuron_facts.len();
+
     // ---- Calendar Events (High-EQ) ----
     let mut high_eq_events: Vec<(String, String, String, i64)> = Vec::new();
-    for fact in &surviving {
+    for fact in &final_extracted {
         if fact.predicate == "born_on" || fact.predicate == "life_event" {
             if let Some(days) = parse_days_until(&fact.object) {
                 if days >= 0 && days <= 14 {
@@ -280,25 +320,6 @@ pub async fn run_dream(dry_run: bool, completion: &dyn ChatCompletion) -> Result
         }
     }
     high_eq_events.sort_by_key(|(_, _, _, d)| *d);
-
-    // ---- Build Final State ----
-    let all_delete_ids: HashSet<String> = contradiction_loser_ids
-        .iter()
-        .chain(weak_ids_to_delete.iter())
-        .cloned()
-        .collect();
-
-    let final_extracted: Vec<Fact> = surviving
-        .into_iter()
-        .filter(|f| !all_delete_ids.contains(&f.id))
-        .collect();
-
-    let total_facts = final_extracted.len() + derived.len() + neuron_facts.len();
-
-    info!(
-        "Phase B: {} contradictions resolved, {} neurons merged",
-        contradictions_resolved, neurons_merged
-    );
 
     // ---- Build Pulse Lines ----
     let mut pulse: Vec<PulseLine> = Vec::new();
@@ -336,29 +357,74 @@ pub async fn run_dream(dry_run: bool, completion: &dyn ChatCompletion) -> Result
         });
     }
 
-    // ---- Persist or Dry-run ----
+    // ---- Summary and Confirmation ----
     if dry_run {
-        info!("Dry-run — no changes written");
+        println!("\n--- Dream Cycle Summary ---");
+        println!("  Decayed facts:           {}", decayed_count);
+        println!("  Contradictions resolved: {}", contradictions_resolved);
+        for detail in &resolution_details {
+            println!("    - {}", detail);
+        }
+        println!("  Neurons synthesized:     {}", neurons_merged);
+        for detail in &neuron_details {
+            println!("    - {}", detail);
+        }
+        println!("  Derived facts:           {}", derived.len());
+        println!("  Total facts in DB:       {}", total_facts);
+
+        println!("\nDry-run — no changes written");
         for line in &pulse {
             println!("{}", serde_json::to_string(line)?);
         }
-    } else {
-        // Replace all facts with the computed final state
-        delete_all_facts(&facts_table).await?;
-        write_facts(&facts_table, &final_extracted).await?;
-        write_facts(&facts_table, &derived).await?;
-        write_facts(&facts_table, &neuron_facts).await?;
-
-        // Write LDJSON briefing
-        let path = "aurelius_db/morning_pulse.ldjson";
-        let file = File::create(path)?;
-        let mut writer = BufWriter::new(file);
-        for line in &pulse {
-            writeln!(writer, "{}", serde_json::to_string(line)?)?;
-        }
-        writer.flush()?;
-        info!("Morning pulse written to {}", path);
+        return Ok(());
     }
+
+    if contradiction_pairs.is_empty() {
+        println!("feeling refreshed");
+    } else {
+        println!("\n--- Dream Cycle Summary ---");
+        println!("  Decayed facts:           {}", decayed_count);
+        println!("  Contradictions resolved: {}", contradictions_resolved);
+        for detail in &resolution_details {
+            println!("    - {}", detail);
+        }
+        println!("  Neurons synthesized:     {}", neurons_merged);
+        for detail in &neuron_details {
+            println!("    - {}", detail);
+        }
+        println!("  Derived facts:           {}", derived.len());
+        println!("  Total facts in DB:       {}", total_facts);
+
+        if !yes {
+            print!("\nApply these changes? [y/N]: ");
+            std::io::stdout().flush()?;
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            if input.trim().to_lowercase() != "y" {
+                println!("Dream cycle aborted.");
+                return Ok(());
+            }
+        }
+    }
+
+    // Replace all facts with the computed final state
+    delete_all_facts(&facts_table).await?;
+    write_facts(&facts_table, &final_extracted).await?;
+    write_facts(&facts_table, &derived).await?;
+    write_facts(&facts_table, &neuron_facts).await?;
+
+    let evicted_table = get_or_create_evicted_facts_table(&db).await?;
+    write_facts(&evicted_table, &evicted).await?;
+
+    // Write LDJSON briefing
+    let path = crate::persistence::morning_pulse_path();
+    let file = File::create(&path)?;
+    let mut writer = BufWriter::new(file);
+    for line in &pulse {
+        writeln!(writer, "{}", serde_json::to_string(line)?)?;
+    }
+    writer.flush()?;
+    info!("Morning pulse written to {:?}", path);
 
     info!(
         "Dream complete: {} total facts, {} decayed, {} neurons merged, {} contradictions resolved",
@@ -368,10 +434,13 @@ pub async fn run_dream(dry_run: bool, completion: &dyn ChatCompletion) -> Result
     Ok(())
 }
 
-/// Parse a date string (YYYY-MM-DD) and return days until the next annual occurrence.
+/// Parse a date string and return days until the next annual occurrence.
 fn parse_days_until(date_str: &str) -> Option<i64> {
     let today = Local::now().date_naive();
-    let date = NaiveDate::parse_from_str(date_str.trim(), "%Y-%m-%d").ok()?;
+    let s = date_str.trim();
+    let date = NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .or_else(|_| NaiveDate::parse_from_str(s, "%d/%m/%Y"))
+        .ok()?;
 
     // Next occurrence of this month/day (treat as annual)
     let this_year = NaiveDate::from_ymd_opt(today.year(), date.month(), date.day()).unwrap_or(date);

@@ -2,14 +2,25 @@ use anyhow::Result;
 use lancedb::connect;
 use std::collections::HashMap;
 use std::io::{self, Write};
+use swiftide::traits::ChatCompletion;
 
 use crate::metabolic::facts::{
-    Fact, delete_facts_by_ids, get_or_create_facts_table, load_all_facts, write_facts,
+    Fact, delete_facts_by_ids, get_or_create_facts_table, load_all_facts, write_facts, Extractor,
+    is_functional_predicate,
 };
 
-pub async fn run_teach(limit: usize) -> Result<()> {
-    let db = connect("aurelius_db").execute().await?;
+pub async fn run_teach(
+    limit: usize,
+    prompt: Option<String>,
+    completion: &dyn ChatCompletion,
+) -> Result<()> {
+    let db = connect(&crate::persistence::db_path()).execute().await?;
     let table = get_or_create_facts_table(&db).await?;
+
+    if let Some(prompt_text) = prompt {
+        return handle_adhoc_teach(&table, &prompt_text, completion).await;
+    }
+
     let facts = load_all_facts(&table).await?;
 
     // Group non-core facts by (subject, predicate)
@@ -26,6 +37,15 @@ pub async fn run_teach(limit: usize) -> Result<()> {
     // Collect contradiction pairs (same key, different object)
     let mut pairs: Vec<(&Fact, &Fact)> = Vec::new();
     for indices in by_key.values() {
+        if indices.is_empty() {
+            continue;
+        }
+
+        let predicate = &facts[indices[0]].predicate;
+        if !is_functional_predicate(predicate) {
+            continue;
+        }
+
         for i in 0..indices.len() {
             for j in (i + 1)..indices.len() {
                 let a = &facts[indices[i]];
@@ -120,5 +140,46 @@ pub async fn run_teach(limit: usize) -> Result<()> {
     }
 
     println!("\nSummary: {} resolved, {} skipped.", resolved, skipped);
+    Ok(())
+}
+
+async fn handle_adhoc_teach(
+    table: &lancedb::table::Table,
+    prompt: &str,
+    completion: &dyn ChatCompletion,
+) -> Result<()> {
+    println!("Extracting facts from prompt...");
+    let extractor = Extractor { completion };
+    let facts = extractor.extract_facts(prompt, "adhoc").await?;
+
+    if facts.is_empty() {
+        println!("No facts extracted from the prompt.");
+        return Ok(());
+    }
+
+    println!("Extracted {} facts:", facts.len());
+    for (i, fact) in facts.iter().enumerate() {
+        println!(
+            "  {}. {} {} {} (confidence: {:.2})",
+            i + 1,
+            fact.subject,
+            fact.predicate,
+            fact.object,
+            fact.confidence
+        );
+    }
+
+    print!("\nSave these facts? [y/N]: ");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+
+    if input.trim().to_lowercase() == "y" {
+        write_facts(table, &facts).await?;
+        println!("Saved {} facts.", facts.len());
+    } else {
+        println!("Discarded facts.");
+    }
+
     Ok(())
 }

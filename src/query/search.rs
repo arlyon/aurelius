@@ -103,8 +103,8 @@ pub async fn run_search(
 ) -> Result<()> {
     println!("pulling from memory...");
 
-    let db_path = "aurelius_db";
-    let db = connect(db_path).execute().await?;
+    let db_path = crate::persistence::db_path();
+    let db = connect(&db_path).execute().await?;
     let table_name = "chunks";
 
     let vector = embedder
