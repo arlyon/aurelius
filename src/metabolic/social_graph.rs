@@ -85,8 +85,7 @@ pub fn run_social_graph(facts: &[Fact]) -> SocialGraphResults {
                     .push((fact.subject.clone(), fact.predicate.clone(), days));
             }
             "invoice_due" => {
-                prog.invoice
-                    .push((fact.id.clone(), fact.subject.clone()));
+                prog.invoice.push((fact.id.clone(), fact.subject.clone()));
             }
             _ => {}
         }
@@ -95,11 +94,7 @@ pub fn run_social_graph(facts: &[Fact]) -> SocialGraphResults {
     prog.run();
 
     SocialGraphResults {
-        hold_communications: prog
-            .hold_communications
-            .into_iter()
-            .map(|(p,)| p)
-            .collect(),
+        hold_communications: prog.hold_communications.into_iter().map(|(p,)| p).collect(),
         blocked_actions: prog
             .blocked_action
             .into_iter()

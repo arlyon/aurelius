@@ -52,8 +52,11 @@ pub async fn run_ls() -> Result<()> {
             }
         }
     }
-    
-    debug!("Processed {} batches and {} nodes from the database", batch_count, node_count);
+
+    debug!(
+        "Processed {} batches and {} nodes from the database",
+        batch_count, node_count
+    );
 
     if file_contents.is_empty() {
         info!("No files found in the database.");

@@ -1,33 +1,69 @@
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::{fmt, path::PathBuf, str::FromStr};
+
+/// A backend+model specifier in the form `backend` or `backend:model-name`.
+/// Supported backends: `ollama`, `lemonade`.
+#[derive(Clone, Debug)]
+pub enum ModelSpec {
+    Ollama(String),
+    Lemonade(String),
+}
+
+impl FromStr for ModelSpec {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.split_once(':') {
+            Some(("ollama", model)) => Ok(Self::Ollama(model.to_string())),
+            Some(("lemonade", model)) => Ok(Self::Lemonade(model.to_string())),
+            Some((backend, _)) => Err(format!(
+                "unknown backend '{backend}'; expected 'ollama' or 'lemonade'"
+            )),
+            None => Err(format!(
+                "unknown backend '{s}'; expected 'ollama:<model>' or 'lemonade:<model>'"
+            )),
+        }
+    }
+}
+
+impl fmt::Display for ModelSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ollama(m) => write!(f, "ollama:{m}"),
+            Self::Lemonade(m) => write!(f, "lemonade:{m}"),
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "aurelius")]
 #[command(about = "Rust-Recall: A fully on-device RAG CLI tool.", long_about = None)]
 pub struct Cli {
-    /// Use quantized version of the embedding model.
-    #[arg(long, global = true)]
-    pub quantized: bool,
+    /// Embedding backend and model (e.g. 'ollama', 'ollama:nomic-embed-text', 'lemonade:user.zembed-1').
+    #[arg(
+        long,
+        global = true,
+        default_value = "ollama:hf.co/Abiray/zembed-1-Q4_K_M-GGUF",
+        value_name = "BACKEND[:MODEL]"
+    )]
+    pub embed: ModelSpec,
 
-    /// Use ollama for embeddings.
-    #[arg(long, global = true)]
-    pub ollama: bool,
+    /// Chat backend and model (e.g. 'ollama', 'ollama:qwen3:8b', 'lemonade:user.Qwen3-35B').
+    #[arg(
+        long,
+        global = true,
+        default_value = "ollama:gemma4:26b",
+        value_name = "BACKEND[:MODEL]"
+    )]
+    pub chat: ModelSpec,
 
-    /// Use lemonade for embeddings and LLM (OpenAI-compatible local server).
+    /// Ollama server base URL.
     #[arg(long, global = true)]
-    pub lemonade: bool,
+    pub ollama_url: Option<String>,
 
     /// Lemonade server base URL.
-    #[arg(long, global = true, default_value = "http://localhost:13305")]
-    pub lemonade_url: String,
-
-    /// Lemonade embedding model name.
-    #[arg(long, global = true, default_value = "user.zembed-1")]
-    pub lemonade_embed_model: String,
-
-    /// Lemonade LLM model name.
-    #[arg(long, global = true, default_value = "user.Qwen3.6-35B-A3B-GGUF-UD-Q4_K_M")]
-    pub lemonade_llm_model: String,
+    #[arg(long, global = true)]
+    pub lemonade_url: Option<String>,
 
     #[command(subcommand)]
     pub command: Commands,
@@ -70,6 +106,24 @@ pub enum Commands {
         #[arg(long)]
         no_think: bool,
     },
+
+    /// Run the nightly metabolic cycle: decay stale facts, resolve contradictions,
+    /// merge weak fact clusters into neurons, and write a morning pulse briefing.
+    Dream {
+        /// Print what would change without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Interactively resolve contradictions in the facts table, locking in Core Truths.
+    Teach {
+        /// Maximum number of contradiction pairs to surface (default: 10).
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
+
+    /// Display the morning pulse dashboard (run `aurelius dream` first).
+    Today,
 
     /// List all ingested files in the database.
     Ls,

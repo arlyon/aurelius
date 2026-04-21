@@ -1,20 +1,30 @@
 use anyhow::Result;
 use arrow_array::Array;
+use chrono::Utc;
 use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
+use serde::Deserialize;
+use std::borrow::Cow;
 use std::collections::HashSet;
-use tracing::info;
+use swiftide::chat_completion::{ChatCompletionRequest, ChatMessage};
+use swiftide::traits::ChatCompletion;
+use tracing::{debug, warn};
+use tracing::{info, trace};
+use uuid::Uuid;
+
+use crate::metabolic::facts::Fact;
 
 use crate::metabolic::facts::{get_or_create_facts_table, write_facts};
-use crate::models::qwen::Qwen;
 
-pub async fn run_extract_facts() -> Result<()> {
+pub async fn run_extract_facts(completion: &impl ChatCompletion) -> Result<()> {
     let db_path = "aurelius_db";
     let db = lancedb::connect(db_path).execute().await?;
 
-    let chunks_table = db.open_table("chunks").execute().await.map_err(|_| {
-        anyhow::anyhow!("No chunks table found — run `aurelius ingest` first")
-    })?;
+    let chunks_table = db
+        .open_table("chunks")
+        .execute()
+        .await
+        .map_err(|_| anyhow::anyhow!("No chunks table found — run `aurelius ingest` first"))?;
 
     let facts_table = get_or_create_facts_table(&db).await?;
 
@@ -100,11 +110,14 @@ pub async fn run_extract_facts() -> Result<()> {
         unanalyzed.len()
     );
 
-    let qwen = Qwen::new();
     let mut total_facts = 0usize;
+    let extractor = Extractor { completion };
 
     for (i, (context_window_id, parent_block)) in unanalyzed.iter().enumerate() {
-        match qwen.extract_facts(parent_block, context_window_id).await {
+        match extractor
+            .extract_facts(parent_block, context_window_id)
+            .await
+        {
             Ok(facts) => {
                 let n = facts.len();
                 if let Err(e) = write_facts(&facts_table, &facts).await {
@@ -120,11 +133,7 @@ pub async fn run_extract_facts() -> Result<()> {
                     );
                 }
             }
-            Err(e) => tracing::warn!(
-                "Qwen error for context window {}: {}",
-                context_window_id,
-                e
-            ),
+            Err(e) => tracing::warn!("Qwen error for context window {}: {}", context_window_id, e),
         }
     }
 
@@ -134,4 +143,179 @@ pub async fn run_extract_facts() -> Result<()> {
         unanalyzed.len()
     );
     Ok(())
+}
+
+struct Extractor<'a> {
+    completion: &'a dyn ChatCompletion,
+}
+
+const FACT_PREDICATES: &str = "born_on, works_at, knows, spouse_of, parent_of, child_of, \
+    located_in, has_skill, member_of, owns, invested_in, life_event, \
+    social_trust, invoice_due, client_of, created_on, deadline_on";
+
+#[derive(Debug, Deserialize)]
+struct RawFact {
+    subject: String,
+    predicate: String,
+    object: String,
+    confidence: f32,
+}
+
+impl<'a> Extractor<'a> {
+    pub async fn extract_facts(&self, chunk: &str, chunk_id: &str) -> Result<Vec<Fact>> {
+        let prompt = format!(
+            r#"Extract atomic facts from the text below. Use ONLY these predicates: {predicates}
+
+Return ONLY a JSON array — no prose, no markdown fences:
+[{{"subject":"...","predicate":"...","object":"...","confidence":0.0}}]
+
+If no facts apply, return: []
+
+Text:
+{chunk}"#,
+            predicates = FACT_PREDICATES,
+            chunk = chunk,
+        );
+
+        debug!("Extracting facts from chunk (len={})", chunk.len());
+        trace!("Prompt: {}", &prompt);
+
+        let response = self
+            .completion
+            .complete(&ChatCompletionRequest {
+                messages: Cow::Borrowed(&[ChatMessage::System(prompt)]),
+                tools_spec: Default::default(),
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("Completion error: {}", e))?;
+
+        let full_response = response.message.unwrap_or_default();
+        debug!(
+            "Response (len={}): {:?}",
+            full_response.len(),
+            &full_response[..full_response.len().min(200)]
+        );
+
+        let json_str = extract_json_array(&full_response);
+
+        match serde_json::from_str::<Vec<RawFact>>(&json_str) {
+            Ok(raw_facts) => {
+                let now = Utc::now().timestamp_micros();
+                let facts = raw_facts
+                    .into_iter()
+                    .filter(|f| !f.subject.trim().is_empty() && !f.object.trim().is_empty())
+                    .map(|f| Fact {
+                        id: Uuid::new_v4().to_string(),
+                        chunk_id: chunk_id.to_string(),
+                        subject: f.subject,
+                        predicate: f.predicate,
+                        object: f.object,
+                        confidence: f.confidence.clamp(0.0, 1.0),
+                        is_core_truth: false,
+                        created_at: now,
+                    })
+                    .collect();
+                Ok(facts)
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to parse facts JSON: {} (raw: {:?})",
+                    e,
+                    &full_response[..full_response.len().min(300)]
+                );
+                Ok(vec![])
+            }
+        }
+    }
+}
+
+fn extract_json_array(s: &str) -> String {
+    if let (Some(start), Some(end)) = (s.find('['), s.rfind(']')) {
+        if start <= end {
+            return s[start..=end].to_string();
+        }
+    }
+    "[]".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+
+    const OLLAMA_URL: &str = "http://localhost:11434/v1/chat/completions";
+    const MODEL: &str = "gemma4:26b";
+
+    /// Sends a streaming chat request to Ollama and collects the full response text.
+    /// `think` controls whether Ollama's extended thinking is enabled.
+    async fn stream_ollama(prompt: &str, think: bool) -> String {
+        let body = serde_json::json!({
+            "model": MODEL,
+            "stream": true,
+            "options": {
+                "think": think
+            },
+            "think": think,
+            "messages": [{"role": "user", "content": prompt}]
+        });
+
+        let response = reqwest::Client::new()
+            .post(OLLAMA_URL)
+            .json(&body)
+            .send()
+            .await
+            .expect("request to Ollama failed");
+
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        assert!(status.is_success(), "Ollama returned {status}: {text}");
+
+        // Parse SSE lines and accumulate content/thinking deltas
+        let mut content = String::new();
+        let mut thinking = String::new();
+
+        for line in text.lines() {
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            if data == "[DONE]" {
+                break;
+            }
+            let Ok(chunk) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
+            if let Some(delta) = chunk["choices"][0]["delta"].as_object() {
+                println!("{:?}", delta);
+                if let Some(t) = delta.get("reasoning").and_then(|v| v.as_str()) {
+                    thinking.push_str(t);
+                }
+                if let Some(c) = delta.get("content").and_then(|v| v.as_str()) {
+                    content.push_str(c);
+                }
+            }
+        }
+
+        eprintln!(
+            "[think={think}] thinking ({} chars): {:?}",
+            thinking.len(),
+            &thinking[..thinking.len().min(120)]
+        );
+        eprintln!("[think={think}] content: {content:?}");
+
+        content
+    }
+
+    /// Run with: cargo test -- --ignored ollama_stream_no_think
+    #[tokio::test]
+    #[ignore = "requires running Ollama with gemma4:26b"]
+    async fn ollama_stream_no_think() {
+        let content = stream_ollama("What is 2 + 2? Reply with just the number.", false).await;
+        assert!(!content.is_empty(), "response should not be empty");
+    }
+
+    /// Run with: cargo test -- --ignored ollama_stream_with_think
+    #[tokio::test]
+    #[ignore = "requires running Ollama with gemma4:26b"]
+    async fn ollama_stream_with_think() {
+        let content = stream_ollama("What is 2 + 2? Reply with just the number.", true).await;
+        assert!(!content.is_empty(), "response should not be empty");
+    }
 }

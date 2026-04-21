@@ -1,8 +1,5 @@
-use crate::models::zembed::Embedder;
-use uuid;
 use anyhow::Result;
 use arrow_array;
-use arrow_array::RecordBatchIterator;
 use arrow_schema;
 use async_trait::async_trait;
 use blake3;
@@ -15,8 +12,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use swiftide::indexing::{self, IndexingStream, Node};
 use swiftide::integrations::lancedb::LanceDB;
-use swiftide::traits::{Loader, NodeCache, Transformer, WithIndexingDefaults};
+use swiftide::traits::{EmbeddingModel, Loader, NodeCache, Transformer, WithIndexingDefaults};
 use tracing::{debug, info, warn};
+use uuid;
 
 #[derive(Clone, Default, Debug)]
 pub struct GitignoreLoader {
@@ -387,9 +385,7 @@ impl NodeCache for Cache {
             )
             .unwrap();
 
-            let reader =
-                RecordBatchIterator::new(vec![Ok(batch)], self.cache_table.schema().await.unwrap());
-            let _ = self.cache_table.add(reader).execute().await;
+            let _ = self.cache_table.add(vec![batch]).execute().await;
         }
     }
 }
@@ -419,8 +415,12 @@ impl swiftide::traits::ChunkerTransformer for HierarchicalChunker {
 
         if total <= CHILD_SIZE {
             let mut child = node;
-            child.metadata.insert("context_window_id".to_string(), context_window_id);
-            child.metadata.insert("parent_block".to_string(), parent_text);
+            child
+                .metadata
+                .insert("context_window_id".to_string(), context_window_id);
+            child
+                .metadata
+                .insert("parent_block".to_string(), parent_text);
             return IndexingStream::from_nodes(vec![child]);
         }
 
@@ -432,8 +432,12 @@ impl swiftide::traits::ChunkerTransformer for HierarchicalChunker {
 
             let mut child = node.clone();
             child.chunk = child_text;
-            child.metadata.insert("context_window_id".to_string(), context_window_id.clone());
-            child.metadata.insert("parent_block".to_string(), parent_text.clone());
+            child
+                .metadata
+                .insert("context_window_id".to_string(), context_window_id.clone());
+            child
+                .metadata
+                .insert("parent_block".to_string(), parent_text.clone());
             children.push(child);
 
             if end >= total {
@@ -448,16 +452,11 @@ impl swiftide::traits::ChunkerTransformer for HierarchicalChunker {
 
 pub async fn run_ingest(
     path: Vec<PathBuf>,
-    quantized: bool,
-    ollama: bool,
-    lemonade: Option<(String, String)>,
+    embedder: impl EmbeddingModel + 'static,
     invalidate_path: Option<String>,
     invalidate_before: Option<String>,
 ) -> Result<()> {
     info!("Starting ingestion for {:?}", path);
-
-    let lemonade_ref = lemonade.as_ref().map(|(url, model)| (url.as_str(), model.as_str()));
-    let embedder = Embedder::new(quantized, ollama, lemonade_ref).await?;
 
     let db_path = "aurelius_db";
     let db = lancedb::connect(db_path).execute().await?;
@@ -505,7 +504,9 @@ pub async fn run_ingest(
             // Drop and recreate if schema is missing required fields
             let existing_schema = t.schema().await?;
             if existing_schema.field_with_name("vector_combined").is_err()
-                || existing_schema.field_with_name("context_window_id").is_err()
+                || existing_schema
+                    .field_with_name("context_window_id")
+                    .is_err()
             {
                 db.drop_table(table_name, &[]).await?;
                 db.create_empty_table(table_name, chunks_schema)

@@ -1,13 +1,13 @@
-use crate::models::gemma::Gemma;
-use crate::models::zembed::Embedder;
 use anyhow::Result;
 use arrow_array::Array;
-use fastembed::TextRerank;
-use futures::TryStreamExt;
-use lance_index::scalar::FullTextSearchQuery;
+use futures::{StreamExt, TryStreamExt};
 use lancedb::connect;
+use lancedb::index::scalar::FullTextSearchQuery;
 use lancedb::query::{ExecutableQuery, QueryBase};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use swiftide::chat_completion::ChatCompletionRequest;
+use swiftide::traits::{ChatCompletion, EmbeddingModel};
 use tracing::{debug, info, warn};
 
 struct Candidate {
@@ -22,7 +22,10 @@ fn extract_candidates(batches: &[arrow_array::RecordBatch]) -> Vec<Candidate> {
         let Some(chunk_col) = batch.column_by_name("chunk") else {
             continue;
         };
-        let Some(chunk_arr) = chunk_col.as_any().downcast_ref::<arrow_array::StringArray>() else {
+        let Some(chunk_arr) = chunk_col
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+        else {
             continue;
         };
         let cwid_arr = batch
@@ -59,15 +62,19 @@ fn rrf_merge(vector_results: Vec<Candidate>, fts_results: Vec<Candidate>) -> Vec
     let mut scores: HashMap<String, (f64, Option<String>, Option<String>)> = HashMap::new();
 
     for (rank, c) in vector_results.iter().enumerate() {
-        let entry = scores
-            .entry(c.chunk.clone())
-            .or_insert((0.0, c.context_window_id.clone(), c.path.clone()));
+        let entry = scores.entry(c.chunk.clone()).or_insert((
+            0.0,
+            c.context_window_id.clone(),
+            c.path.clone(),
+        ));
         entry.0 += 1.0 / (60.0 + rank as f64);
     }
     for (rank, c) in fts_results.iter().enumerate() {
-        let entry = scores
-            .entry(c.chunk.clone())
-            .or_insert((0.0, c.context_window_id.clone(), c.path.clone()));
+        let entry = scores.entry(c.chunk.clone()).or_insert((
+            0.0,
+            c.context_window_id.clone(),
+            c.path.clone(),
+        ));
         entry.0 += 1.0 / (60.0 + rank as f64);
     }
 
@@ -88,19 +95,24 @@ fn rrf_merge(vector_results: Vec<Candidate>, fts_results: Vec<Candidate>) -> Vec
     ranked.into_iter().map(|(_, c)| c).collect()
 }
 
-pub async fn run_search(query: String, quantized: bool, ollama: bool, lemonade: Option<(String, String, String)>, thinking: bool) -> Result<()> {
+pub async fn run_search(
+    query: String,
+    embedder: &impl EmbeddingModel,
+    completion: &impl ChatCompletion,
+    thinking: bool,
+) -> Result<()> {
     println!("pulling from memory...");
-
-    let lemonade_embed = lemonade.as_ref().map(|(url, embed, _)| (url.as_str(), embed.as_str()));
-    let lemonade_llm = lemonade.as_ref().map(|(url, _, llm)| (url.as_str(), llm.as_str()));
-    let embedder = Embedder::new(quantized, ollama, lemonade_embed).await?;
-    let gemma = Gemma::new(ollama, lemonade_llm).await.ok();
 
     let db_path = "aurelius_db";
     let db = connect(db_path).execute().await?;
     let table_name = "chunks";
 
-    let vector = embedder.embed_query(&query).await?;
+    let vector = embedder
+        .embed(vec![query.clone()])
+        .await?
+        .into_iter()
+        .next()
+        .unwrap();
     let table = db.open_table(table_name).execute().await?;
 
     // 1. Vector search
@@ -133,21 +145,31 @@ pub async fn run_search(query: String, quantized: bool, ollama: bool, lemonade: 
         extract_candidates(&fts_batches),
     );
     let total_candidates = candidates.len();
-    info!("retrieved {} unique candidates (RRF merged)", total_candidates);
+    info!(
+        "retrieved {} unique candidates (RRF merged)",
+        total_candidates
+    );
 
     // 4. Rerank top 20 → top 5
-    let top_k = 5usize;
     let rerank_pool: Vec<&Candidate> = candidates.iter().take(20).collect();
-    let pool_texts: Vec<String> = rerank_pool.iter().map(|c| c.chunk.clone()).collect();
 
-    let top_indices: Vec<usize> = if rerank_pool.len() <= top_k {
-        (0..rerank_pool.len()).collect()
-    } else {
-        let mut reranker = TextRerank::try_new(Default::default())?;
-        let mut results = reranker.rerank::<String>(query.clone(), &pool_texts, false, None)?;
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        results.into_iter().take(top_k).map(|r| r.index).collect()
-    };
+    let top_indices: Vec<usize> = (0..rerank_pool.len()).collect();
+
+    // TODO: re-enable ranking
+    // let top_k = 5usize;
+    // let pool_texts: Vec<String> = rerank_pool.iter().map(|c| c.chunk.clone()).collect();
+    // let top_indices: Vec<usize> = if rerank_pool.len() <= top_k {
+    //     (0..rerank_pool.len()).collect()
+    // } else {
+    //     let mut reranker = TextRerank::try_new(Default::default())?;
+    //     let mut results = reranker.rerank::<String>(query.clone(), &pool_texts, false, None)?;
+    //     results.sort_by(|a, b| {
+    //         b.score
+    //             .partial_cmp(&a.score)
+    //             .unwrap_or(std::cmp::Ordering::Equal)
+    //     });
+    //     results.into_iter().take(top_k).map(|r| r.index).collect()
+    // };
 
     let top_candidates: Vec<&Candidate> = top_indices.iter().map(|&i| rerank_pool[i]).collect();
 
@@ -239,21 +261,29 @@ pub async fn run_search(query: String, quantized: bool, ollama: bool, lemonade: 
         context.push_str("No relevant context found in the database.\n");
     }
 
-    if let Some(mut g) = gemma {
-        let prompt = format!(
-            "You are an AI assistant. Use the following context to answer the query: {}\n\nContext:\n{}\n\nAnswer with inline citations (e.g. [file.txt]).",
-            query, context
-        );
-        match g.generate(&prompt, 512, thinking).await {
-            Ok(_) => {}
+    let mut completion = completion.complete_stream(&ChatCompletionRequest{
+        messages: Cow::Borrowed(&[
+            swiftide::chat_completion::ChatMessage::System("You are an AI assistant. Use the provided context to answer the user's query. Always include inline citations to the sources in the context (e.g. [file.txt]). If the context is insufficient to answer, say so.".to_string()),
+
+            swiftide::chat_completion::ChatMessage::User(
+
+
+            format!("Query: {}\n\nContext:\n{}", query, context),
+            )
+        ]),
+        tools_spec: Default::default()
+    }).await;
+
+    while let Some(part) = completion.next().await {
+        match part {
+            Ok(chunk) => {
+                print!("{}", chunk.delta.unwrap().message_chunk.unwrap_or_default());
+            }
             Err(e) => {
-                warn!("Synthesis failed: {}. Showing only context.", e);
-                println!("\nSynthesis: (Could not generate answer, please refer to the context above.)");
+                eprintln!("Error during completion: {}", e);
+                break;
             }
         }
-    } else {
-        println!("\nSynthesis: (LLM model could not be initialized, showing context only.)");
-        println!("--- Retrieved Context ---\n{}", context);
     }
 
     Ok(())
