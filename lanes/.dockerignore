@@ -1,0 +1,9 @@
+*
+!.build
+.build/*
+!.build/worker
+!.build/worker-arm64
+!.build/model.gguf
+!.build/model-lock.json
+!entrypoint.sh
+!Dockerfile
