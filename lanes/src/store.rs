@@ -236,7 +236,7 @@ impl Store {
         let profile = fingerprint(lane)?;
         if let Some(row) = row {
             let previous: DateTime<Utc> = row.get("latest_modified_at");
-            if doc.modified_at < previous {
+            if doc.modified_at.timestamp_micros() < previous.timestamp_micros() {
                 return Ok(false);
             }
             if !doc.deleted
@@ -249,7 +249,7 @@ impl Store {
             {
                 return Ok(false);
             }
-            if doc.modified_at == previous {
+            if doc.modified_at.timestamp_micros() == previous.timestamp_micros() {
                 ensure!(
                     row.get::<String, _>("latest_hash") == hash
                         || row
@@ -299,7 +299,10 @@ impl Store {
         let row=sqlx::query("SELECT latest_hash,latest_modified_at,active_artifact_id,(SELECT deleted FROM document_changes e WHERE e.organization_id=$1 AND e.lane=$2 AND e.source_id=$3 ORDER BY cursor DESC LIMIT 1) AS published_deleted FROM lake_documents WHERE organization_id=$1 AND lane=$2 AND source_id=$3 FOR UPDATE")
             .bind(&lane.organization_id).bind(&lane.name).bind(&doc.id).fetch_one(&mut *tx).await?;
         if row.get::<String, _>("latest_hash") != doc.hash()
-            || row.get::<DateTime<Utc>, _>("latest_modified_at") != doc.modified_at
+            || row
+                .get::<DateTime<Utc>, _>("latest_modified_at")
+                .timestamp_micros()
+                != doc.modified_at.timestamp_micros()
         {
             return Ok(());
         }
