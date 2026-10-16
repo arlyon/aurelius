@@ -57,6 +57,7 @@ pub struct Options {
     pub fresh: bool,
     pub batch_adjacent: bool,
     pub max_calls: usize,
+    pub max_batch_bytes: usize,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RecordResult {
@@ -68,7 +69,7 @@ pub struct RecordResult {
     pub source_content_hash: String,
     pub source_range: ByteRange,
     pub source_text: Option<String>,
-    pub proposals: Vec<TypedCandidate>,
+    pub proposals: Vec<Value>,
     #[serde(default)]
     pub argument_texts: BTreeMap<String, String>,
     pub graph: Option<QualityGraph>,
@@ -183,6 +184,18 @@ pub fn load(path: &Path) -> Result<Vec<LabRecord>> {
     Ok(output)
 }
 pub fn units(records: &[LabRecord], selected: &BTreeSet<String>, batch: bool) -> Result<Vec<Unit>> {
+    units_bounded(records, selected, batch, 4096)
+}
+pub fn units_bounded(
+    records: &[LabRecord],
+    selected: &BTreeSet<String>,
+    batch: bool,
+    max_bytes: usize,
+) -> Result<Vec<Unit>> {
+    ensure!(
+        (1..=32768).contains(&max_bytes),
+        "invalid adjacent batching byte budget"
+    );
     ensure!(
         selected
             .iter()
@@ -231,7 +244,7 @@ pub fn units(records: &[LabRecord], selected: &BTreeSet<String>, batch: bool) ->
                     .text
                     .get(a.range.end..b.range.start)
                     .is_some_and(|text| text.chars().all(char::is_whitespace));
-            if same && gap_ok && b.range.end.max(a.range.end) - a.range.start <= 32768 {
+            if same && gap_ok && b.range.end.max(a.range.end) - a.range.start <= max_bytes {
                 previous.record.range.end = previous.record.range.end.max(b.range.end);
                 previous.members.extend(unit.members);
                 previous.id = format!(
@@ -398,6 +411,9 @@ fn replay_body(directory: &Path, unit: &Unit) -> Result<(String, usize)> {
     .context("replay response missing")?;
     let value: Value = serde_json::from_slice(&bounded(&path, 1024 * 1024)?)
         .map_err(|_| anyhow::anyhow!("invalid replay JSON"))?;
+    if let Some(status) = value.get("status").and_then(Value::as_str) {
+        ensure!(status == "completed", ReviewDiagnostic::ReplayUnavailable);
+    }
     if value.get("source").is_some() {
         ensure!(
             value["source"] == serde_json::to_value(&unit.record.document.key)?
@@ -462,7 +478,12 @@ pub async fn run(config: &Config, records: &[LabRecord], options: &Options) -> R
         .as_ref()
         .context("typed policy required")?;
     policy.validate(&config.ontology)?;
-    let selected = units(records, &options.selected, options.batch_adjacent)?;
+    let selected = units_bounded(
+        records,
+        &options.selected,
+        options.batch_adjacent,
+        options.max_batch_bytes,
+    )?;
     std::fs::create_dir_all(&options.output)?;
     std::fs::set_permissions(&options.output, std::fs::Permissions::from_mode(0o700))?;
     let extractor = if live {
@@ -473,10 +494,17 @@ pub async fn run(config: &Config, records: &[LabRecord], options: &Options) -> R
     } else {
         None
     };
+    let base_profile = ChatExtractor::profile_for(
+        config
+            .chat
+            .as_ref()
+            .context("chat configuration required")?,
+        &config.ontology,
+    )?;
     let mut ledger = Ledger::new(&options.output.join("attempts.jsonl"), options.max_calls)?;
     private_json(
         &options.output.join("manifest.json"),
-        &json!({"version":LAB_VERSION,"live":live,"max_calls":options.max_calls,"fresh_preparation":options.fresh,"batch_adjacent":options.batch_adjacent,"config_hash":blake3::hash(&serde_json::to_vec(config)?).to_hex().to_string(),"records_hash":blake3::hash(&serde_json::to_vec(records)?).to_hex().to_string(),"units":selected.iter().map(|unit|json!({"id":unit.id,"members":unit.members,"document":unit.record.document.key,"range":unit.record.range})).collect::<Vec<_>>(),"production_writes":0}),
+        &json!({"version":LAB_VERSION,"live":live,"max_calls":options.max_calls,"fresh_preparation":options.fresh,"batch_adjacent":options.batch_adjacent,"max_batch_bytes":options.max_batch_bytes,"config_hash":blake3::hash(&serde_json::to_vec(config)?).to_hex().to_string(),"records_hash":blake3::hash(&serde_json::to_vec(records)?).to_hex().to_string(),"units":selected.iter().map(|unit|json!({"id":unit.id,"members":unit.members,"document":unit.record.document.key,"range":unit.record.range})).collect::<Vec<_>>(),"production_writes":0}),
     )?;
     let language_profile = LanguageRuntime::profile_for(
         config
@@ -499,6 +527,7 @@ pub async fn run(config: &Config, records: &[LabRecord], options: &Options) -> R
         semantic_accuracy: "not automatically measured; compare source and expectations manually",
         ..Default::default()
     };
+    let mut all_usage_fields = true;
     let mut display = String::from(
         "# Local fact extraction\n\nUnreviewed proposals, not accepted truths. No production writes.\n",
     );
@@ -539,9 +568,10 @@ pub async fn run(config: &Config, records: &[LabRecord], options: &Options) -> R
                     .and_then(|()| crate::facts::validate_model_input(&input))
                     .context(ExtractionReview::Input)?;
                 let profile = policy.profile(
-                    &config.ontology.semantic_hash()?,
+                    &base_profile,
                     &prepared.preparation_profile,
                 )?;
+                private_json(&options.output.join(format!("request-{}.json", unit.id)), &json!({"system_prompt":prompt,"input":serde_json::from_str::<Value>(&input)?,"transport_credentials_included":false,"purpose":"private local debug artifact; provider payload logging remains disabled"}))?;
                 result.source_text = Some(chunk.text()?.into());
                 result.argument_texts = prepared
                     .language
@@ -577,7 +607,15 @@ pub async fn run(config: &Config, records: &[LabRecord], options: &Options) -> R
                             Mode::Live => unreachable!(),
                         },
                         &unit,
-                    )?;
+                    )
+                    .map_err(|error| {
+                        if error.downcast_ref::<ReviewDiagnostic>().is_some() {
+                            error
+                        } else {
+                            error.context(ReviewDiagnostic::ReplayUnavailable)
+                        }
+                    })
+                    .context(ExtractionReview::Output)?;
                     result.historical_rejections_unavailable = unavailable;
                     result.proposals =
                         quality::parse_proposals(&body).context(ExtractionReview::Output)?;
@@ -602,6 +640,15 @@ pub async fn run(config: &Config, records: &[LabRecord], options: &Options) -> R
                     summary.completed_units += 1;
                 }
                 Err(error) => {
+                    result.usage = crate::facts::review_usage(&error);
+                    if let Some(output) = crate::facts::review_output(&error) {
+                        private_json(
+                            &options
+                                .output
+                                .join(format!("failed-output-{}.json", unit.id)),
+                            &json!({"purpose":"untrusted model output for private local diagnosis only; not accepted evidence","output":output}),
+                        )?;
+                    }
                     result.diagnostic = Some(crate::facts::review_diagnostic(&error));
                     summary.review_units += 1;
                     match error.downcast_ref::<ExtractionReview>() {
@@ -624,6 +671,7 @@ pub async fn run(config: &Config, records: &[LabRecord], options: &Options) -> R
         }
         if let Some(usage) = &result.usage {
             summary.usage_records += 1;
+            all_usage_fields &= usage.input_tokens.is_some() && usage.output_tokens.is_some();
             summary.input_tokens += usage.input_tokens.unwrap_or_default();
             summary.cached_input_tokens += usage.cached_input_tokens.unwrap_or_default();
             summary.output_tokens += usage.output_tokens.unwrap_or_default();
@@ -666,6 +714,12 @@ pub async fn run(config: &Config, records: &[LabRecord], options: &Options) -> R
                     .map(String::as_str)
                     .unwrap_or("unknown mention")
             };
+            let Ok(proposal) = serde_json::from_value::<TypedCandidate>(proposal.clone()) else {
+                display.push_str(&format!(
+                    "- {status}: invalid typed candidate; raw payload retained privately.\n"
+                ));
+                continue;
+            };
             let body = match &proposal.body {
                 quality::TypedBody::Relation { predicate, object } => {
                     format!("{} → {}", predicate, label(&object.mention_id))
@@ -689,7 +743,7 @@ pub async fn run(config: &Config, records: &[LabRecord], options: &Options) -> R
         );
     }
     summary.attempts = ledger.attempts;
-    summary.usage_complete = summary.usage_records == summary.attempts;
+    summary.usage_complete = summary.usage_records == summary.attempts && all_usage_fields;
     summary.calculated_cost_usd =
         (summary.input_tokens as f64 * 0.10 + summary.output_tokens as f64 * 0.50) / 1_000_000.;
     private_json(&options.output.join("summary.json"), &summary)?;

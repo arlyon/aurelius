@@ -139,6 +139,8 @@ pub enum ReviewDiagnostic {
     TypedJson,
     CandidateBudget,
     UnclassifiedValidation,
+    ReplayUnavailable,
+    InputBudget,
 }
 impl std::fmt::Display for ReviewDiagnostic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -152,13 +154,49 @@ pub struct ExtractionUsage {
     pub cached_input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
 }
+#[derive(Debug)]
+struct ReviewUsage(ExtractionUsage);
+impl std::fmt::Display for ReviewUsage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("model usage attached")
+    }
+}
+impl std::error::Error for ReviewUsage {}
+pub fn review_usage(error: &anyhow::Error) -> Option<ExtractionUsage> {
+    error
+        .downcast_ref::<ReviewUsage>()
+        .map(|usage| usage.0.clone())
+}
+fn with_usage(error: anyhow::Error, usage: Option<&ExtractionUsage>) -> anyhow::Error {
+    match usage {
+        Some(usage) => error.context(ReviewUsage(usage.clone())),
+        None => error,
+    }
+}
+struct OutputTrace(String);
+impl std::fmt::Debug for OutputTrace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OutputTrace([withheld])")
+    }
+}
+impl std::fmt::Display for OutputTrace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("model output attached privately")
+    }
+}
+impl std::error::Error for OutputTrace {}
+pub fn review_output(error: &anyhow::Error) -> Option<&str> {
+    error
+        .downcast_ref::<OutputTrace>()
+        .map(|trace| trace.0.as_str())
+}
 struct ModelOutput {
     text: String,
     usage: Option<ExtractionUsage>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct QualityExtraction {
-    pub proposals: Vec<crate::quality::TypedCandidate>,
+    pub proposals: Vec<serde_json::Value>,
     pub graph: crate::quality::QualityGraph,
     pub usage: Option<ExtractionUsage>,
 }
@@ -183,6 +221,20 @@ pub struct ChatExtractor {
     references: crate::references::ReferenceConfig,
 }
 impl ChatExtractor {
+    pub fn profile_for(settings: &ChatConfig, ontology: &Ontology) -> Result<String> {
+        settings.validate()?;
+        Ok(blake3::hash(&serde_json::to_vec(&(
+            CONTRACT_VERSION,
+            PROMPT_VERSION,
+            settings.api,
+            settings.references.semantic_hash()?,
+            &settings.model,
+            &settings.revision,
+            ontology.semantic_hash()?,
+        ))?)
+        .to_hex()
+        .to_string())
+    }
     pub fn new(settings: &ChatConfig, ontology: Ontology) -> Result<Self> {
         Self::with_credentials(settings, ontology, crate::config::credential)
     }
@@ -193,17 +245,7 @@ impl ChatExtractor {
     ) -> Result<Self> {
         let endpoint = settings.validate()?;
         let ontology_hash = ontology.semantic_hash()?;
-        let profile = blake3::hash(&serde_json::to_vec(&(
-            CONTRACT_VERSION,
-            PROMPT_VERSION,
-            settings.api,
-            settings.references.semantic_hash()?,
-            &settings.model,
-            &settings.revision,
-            &ontology_hash,
-        ))?)
-        .to_hex()
-        .to_string();
+        let profile = Self::profile_for(settings, &ontology)?;
         let prompt = format!(
             "{PROMPT}\nThe user JSON contains source_text and deterministic reference_hints. Hints are source-local hypotheses, not accepted identity merges or additional evidence. Keep quotes and argument mentions verbatim in source_text. Do not perform additional coreference inference: without an explicit hint, retain the mention's verbatim form, including unresolved pronouns.\nConfigured ontology:\n{}",
             serde_json::to_string(&ontology)?
@@ -256,7 +298,14 @@ impl ChatExtractor {
         let input =
             serde_json::to_string(&json!({"source_text":text,"reference_hints":references}))?;
         let content = self
-            .complete(chunk, &self.prompt, &input, &self.profile, PROMPT_VERSION)
+            .complete(
+                chunk,
+                &self.prompt,
+                &input,
+                &self.profile,
+                PROMPT_VERSION,
+                4096,
+            )
             .await?;
         self.graph(
             chunk,
@@ -288,6 +337,13 @@ impl ChatExtractor {
             .await?
             .graph)
     }
+    fn with_output(&self, error: anyhow::Error, text: &str) -> anyhow::Error {
+        if validate_model_input(text).is_ok() {
+            error.context(OutputTrace(text.into()))
+        } else {
+            error
+        }
+    }
     pub async fn extract_quality_detailed(
         &self,
         chunk: &Chunk,
@@ -304,10 +360,17 @@ impl ChatExtractor {
                 &input,
                 profile,
                 crate::quality::QUALITY_VERSION,
+                policy.max_output_tokens.unwrap_or(4096),
             )
             .await?;
-        let proposals =
-            crate::quality::parse_proposals(&content.text).context(ExtractionReview::Output)?;
+        let proposals = crate::quality::parse_proposals(&content.text)
+            .map_err(|error| {
+                with_usage(
+                    self.with_output(error, &content.text),
+                    content.usage.as_ref(),
+                )
+            })
+            .context(ExtractionReview::Output)?;
         let graph = crate::quality::parse_graph(
             &content.text,
             chunk,
@@ -316,6 +379,12 @@ impl ChatExtractor {
             policy,
             profile,
         )
+        .map_err(|error| {
+            with_usage(
+                self.with_output(error, &content.text),
+                content.usage.as_ref(),
+            )
+        })
         .context(ExtractionReview::Output)?;
         Ok(QualityExtraction {
             proposals,
@@ -330,16 +399,17 @@ impl ChatExtractor {
         input: &str,
         profile: &str,
         prompt_version: &str,
+        max_output_tokens: u32,
     ) -> Result<ModelOutput> {
         validate_model_input(prompt)
             .and_then(|()| validate_model_input(input))
             .context(ExtractionReview::Input)?;
         let body = match self.api {
             ChatApi::ChatCompletions => {
-                json!({"model":self.model,"temperature":0,"max_tokens":4096,"messages":[{"role":"system","content":prompt},{"role":"user","content":input}]})
+                json!({"model":self.model,"temperature":0,"max_tokens":max_output_tokens,"messages":[{"role":"system","content":prompt},{"role":"user","content":input}]})
             }
             ChatApi::Responses => {
-                json!({"model":self.model,"max_output_tokens":4096,"store":false,"text":{"format":{"type":"json_object"}},"input":[{"role":"system","content":prompt},{"role":"user","content":input}]})
+                json!({"model":self.model,"max_output_tokens":max_output_tokens,"store":false,"text":{"format":{"type":"json_object"}},"input":[{"role":"system","content":prompt},{"role":"user","content":input}]})
             }
         };
         let mut request = self.client.post(self.endpoint.clone()).json(&body);
@@ -374,8 +444,24 @@ impl ChatExtractor {
             }
             bytes.extend_from_slice(&chunk);
         }
+        let response: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| anyhow::Error::new(ReviewDiagnostic::EnvelopeJson))
+            .context(ExtractionReview::Output)?;
+        let usage = response.get("usage").map(|usage| ExtractionUsage {
+            input_tokens: usage
+                .get("input_tokens")
+                .or_else(|| usage.get("prompt_tokens"))
+                .and_then(Value::as_u64),
+            cached_input_tokens: usage
+                .pointer("/input_tokens_details/cached_tokens")
+                .or_else(|| usage.pointer("/prompt_tokens_details/cached_tokens"))
+                .and_then(Value::as_u64),
+            output_tokens: usage
+                .get("output_tokens")
+                .or_else(|| usage.get("completion_tokens"))
+                .and_then(Value::as_u64),
+        });
         (|| ->Result<ModelOutput> {
-        let response: Value = serde_json::from_slice(&bytes).map_err(|_| anyhow::Error::new(ReviewDiagnostic::EnvelopeJson))?;
         if let Some(usage) = response.get("usage") {
             tracing::info!(org_id=%chunk.document.key.scope,model=%self.model,profile=%profile,input_tokens=usage.get("input_tokens").or_else(||usage.get("prompt_tokens")).and_then(|v|v.as_u64()),cached_input_tokens=usage.pointer("/input_tokens_details/cached_tokens").or_else(||usage.pointer("/prompt_tokens_details/cached_tokens")).and_then(|v|v.as_u64()),output_tokens=usage.get("output_tokens").or_else(||usage.get("completion_tokens")).and_then(|v|v.as_u64()),"fact extraction usage");
         }
@@ -436,13 +522,8 @@ impl ChatExtractor {
                     .context("missing extraction text")?
             }
         };
-        let usage = response.get("usage").map(|usage| ExtractionUsage {
-            input_tokens: usage.get("input_tokens").or_else(||usage.get("prompt_tokens")).and_then(Value::as_u64),
-            cached_input_tokens: usage.pointer("/input_tokens_details/cached_tokens").or_else(||usage.pointer("/prompt_tokens_details/cached_tokens")).and_then(Value::as_u64),
-            output_tokens: usage.get("output_tokens").or_else(||usage.get("completion_tokens")).and_then(Value::as_u64),
-        });
-        Ok(ModelOutput { text: content.to_owned(), usage })
-        })().map_err(|error| if error.downcast_ref::<ReviewDiagnostic>().is_some() { error } else { error.context(ReviewDiagnostic::EnvelopeShape) }).context(ExtractionReview::Output)
+        Ok(ModelOutput { text: content.to_owned(), usage: usage.clone() })
+        })().map_err(|error| if error.downcast_ref::<ReviewDiagnostic>().is_some() { error } else { error.context(ReviewDiagnostic::EnvelopeShape) }).map_err(|error| with_usage(self.with_output(error, &response.to_string()), usage.as_ref())).context(ExtractionReview::Output)
     }
     pub fn graph(&self, chunk: &Chunk, candidates: Vec<Candidate>) -> Result<CandidateGraph> {
         let candidates = parse_candidates(
@@ -629,6 +710,16 @@ mod gateway_tests {
             );
             Ok("fixture-only-token".into())
         })?;
+        assert_eq!(
+            extractor.profile,
+            ChatExtractor::profile_for(&config, &ontology)?
+        );
+        let mut changed_model = config.clone();
+        changed_model.model = "another-fixture-model".into();
+        assert_ne!(
+            extractor.profile,
+            ChatExtractor::profile_for(&changed_model, &ontology)?
+        );
         let chunk = |scope: &str, text: &str| Chunk {
             document: Document {
                 key: DocumentKey {

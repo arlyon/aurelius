@@ -779,7 +779,7 @@ mod driver {
             );
             let checked = crate::quality::parse_graph(
                 &serde_json::to_string(
-                    &json!({"facts":graph.candidates.iter().map(|candidate|&candidate.candidate).collect::<Vec<_>>()}),
+                    &json!({"facts":graph.candidates.iter().map(|candidate|candidate.proposed.as_ref().unwrap_or(&candidate.candidate)).collect::<Vec<_>>()}),
                 )?,
                 chunk,
                 prepared,

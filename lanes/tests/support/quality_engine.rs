@@ -140,6 +140,45 @@ pub async fn exercise(
         diagnostic == "typed_json",
         "structured review cause was lost from durable receipts"
     );
+    let mut aligned_policy = config.fact_quality.as_ref().context("quality")?.clone();
+    aligned_policy.align_whitespace = true;
+    let mut spaced = graph.candidates[0].candidate.clone();
+    spaced.quote = spaced.quote.replace(' ', "\r\n");
+    let aligned = aurelius_lanes::quality::parse_graph(
+        &json!({"facts":[spaced]}).to_string(),
+        &chunk,
+        &prepared,
+        &config.ontology,
+        &aligned_policy,
+        &"e".repeat(64),
+    )?;
+    ensure!(aligned.candidates.len() == 1 && aligned.candidates[0].proposed.is_some());
+    sink.write_quality_candidates(
+        &chunk,
+        &aligned,
+        &prepared,
+        &config.ontology,
+        &aligned_policy,
+    )
+    .await?;
+    let mut forged_alignment = aligned.clone();
+    forged_alignment.candidates[0]
+        .proposed
+        .as_mut()
+        .expect("original proposal")
+        .quote = "fabricated source".into();
+    ensure!(
+        sink.write_quality_candidates(
+            &chunk,
+            &forged_alignment,
+            &prepared,
+            &config.ontology,
+            &aligned_policy
+        )
+        .await
+        .is_err(),
+        "forged alignment provenance accepted"
+    );
     let mut changed_layout = graph.clone();
     changed_layout.source_layout_hash = "f".repeat(64);
     ensure!(

@@ -211,11 +211,25 @@ fn source_metadata_moves_only_in_suffix_and_empty_extraction_is_normal() -> Resu
     let (x, y) = quality::model_input(&changed, &p, &config.ontology, &policy)?;
     assert_eq!(a, x);
     assert_ne!(b, y);
+    let input: Value = serde_json::from_str(&b)?;
+    assert_eq!(input["mentions"][0].as_object().unwrap().len(), 3);
+    assert!(input["mentions"][0].get("raw_mention_score").is_none());
+    let mut reordered = p.clone();
+    reordered.language.coreference_hypotheses = vec![vec!["company".into(), "ada".into()]];
+    let (_, left) = quality::model_input(&c, &reordered, &config.ontology, &policy)?;
+    reordered.language.coreference_hypotheses[0].reverse();
+    let (_, right) = quality::model_input(&c, &reordered, &config.ontology, &policy)?;
+    assert_eq!(left, right);
     let empty = graph(vec![])?;
     assert!(empty.candidates.is_empty() && empty.rejections.is_empty());
     let mut forged = relation();
     forged["subject"]["canonical_id"] = json!("user:invented");
-    assert!(graph(vec![forged]).is_err());
+    let rejected = graph(vec![forged])?;
+    assert!(rejected.candidates.is_empty());
+    assert_eq!(
+        rejected.rejections[0].reason,
+        RejectionReason::InvalidCandidateShape
+    );
     Ok(())
 }
 #[test]
@@ -464,10 +478,33 @@ fn a_literal_cannot_ground_an_entity_by_repeating_its_type_as_property() -> Resu
     Ok(())
 }
 #[test]
+fn malformed_candidate_does_not_discard_independent_well_typed_claims() -> Result<()> {
+    let (chunk, prepared, config, policy) = fixture()?;
+    let body = json!({"facts":[relation(),{"secret_untrusted_field":"do-not-log"}]}).to_string();
+    assert_eq!(quality::parse_proposals(&body)?.len(), 2);
+    let graph = quality::parse_graph(
+        &body,
+        &chunk,
+        &prepared,
+        &config.ontology,
+        &policy,
+        &"c".repeat(64),
+    )?;
+    assert_eq!(graph.candidates.len(), 1);
+    assert_eq!(graph.rejections.len(), 1);
+    assert_eq!(graph.rejections[0].index, 1);
+    assert_eq!(
+        graph.rejections[0].reason,
+        RejectionReason::InvalidCandidateShape
+    );
+    assert!(!serde_json::to_string(&graph)?.contains("do-not-log"));
+    Ok(())
+}
+#[test]
 fn invalid_typed_json_has_a_safe_persistable_diagnostic() -> Result<()> {
     let (chunk, prepared, config, policy) = fixture()?;
     let error = quality::parse_graph(
-        r#"{"facts":[{"secret_untrusted_field":"do-not-log"}]}"#,
+        r#"{"facts":[],"secret_untrusted_field":"do-not-log"}"#,
         &chunk,
         &prepared,
         &config.ontology,
@@ -493,6 +530,216 @@ fn invalid_typed_json_has_a_safe_persistable_diagnostic() -> Result<()> {
     assert_eq!(
         aurelius_lanes::facts::review_diagnostic(&error),
         aurelius_lanes::facts::ReviewDiagnostic::CandidateBudget
+    );
+    Ok(())
+}
+#[test]
+fn opt_in_whitespace_alignment_restores_original_bytes_and_retains_proposal() -> Result<()> {
+    let (chunk, prepared, config, mut policy) = fixture()?;
+    let mut proposed = relation();
+    proposed["quote"] = json!("Ada\r\nmanages Company if\tapproved.");
+    proposed["qualifiers"]["conditions"] = json!(["if\tapproved"]);
+    let strict = quality::parse_graph(
+        &json!({"facts":[proposed.clone()]}).to_string(),
+        &chunk,
+        &prepared,
+        &config.ontology,
+        &policy,
+        &"c".repeat(64),
+    )?;
+    assert!(strict.candidates.is_empty());
+    policy.align_whitespace = true;
+    let graph = quality::parse_graph(
+        &json!({"facts":[proposed.clone()]}).to_string(),
+        &chunk,
+        &prepared,
+        &config.ontology,
+        &policy,
+        &"c".repeat(64),
+    )?;
+    assert_eq!(graph.candidates.len(), 1);
+    let checked = &graph.candidates[0];
+    assert_eq!(
+        serde_json::to_value(checked.proposed.as_ref().unwrap())?,
+        proposed
+    );
+    assert_eq!(checked.candidate.quote, "Ada manages Company if approved.");
+    assert_eq!(
+        checked.evidence[0].quote,
+        checked.evidence[0].range.text(&chunk.document)?
+    );
+    assert_eq!(checked.candidate.qualifiers.conditions, ["if approved"]);
+    policy.properties.insert(
+        "note".into(),
+        serde_json::from_value(
+            json!({"description":"Verbatim note","subject_types":["person"],"value_kind":"text"}),
+        )?,
+    );
+    let mut literal = proposed.clone();
+    literal["body"] = json!({"kind":"property","property":"note","value":{"kind":"text","value":"manages\r\nCompany if\tapproved"},"value_quote":"manages\r\nCompany if\tapproved"});
+    let resolved = quality::parse_graph(
+        &json!({"facts":[literal]}).to_string(),
+        &chunk,
+        &prepared,
+        &config.ontology,
+        &policy,
+        &"c".repeat(64),
+    )?;
+    assert_eq!(resolved.candidates.len(), 1);
+    let value = serde_json::to_value(&resolved.candidates[0].candidate.body)?;
+    assert_eq!(value["value_quote"], "manages Company if approved");
+    assert_eq!(value["value"]["value"], value["value_quote"]);
+    let mut bad = proposed;
+    bad["quote"] = json!("Ada never manages Company if approved.");
+    assert!(
+        quality::parse_graph(
+            &json!({"facts":[bad]}).to_string(),
+            &chunk,
+            &prepared,
+            &config.ontology,
+            &policy,
+            &"c".repeat(64)
+        )?
+        .candidates
+        .is_empty()
+    );
+    Ok(())
+}
+#[test]
+fn literal_occurrence_alignment_uses_real_quote_local_nlp_mentions_not_identity_merges()
+-> Result<()> {
+    let (mut chunk, mut prepared, config, mut policy) = fixture()?;
+    let mut later = prepared
+        .language
+        .mentions
+        .iter()
+        .find(|m| m.id == "ada")
+        .unwrap()
+        .clone();
+    chunk.document.text.push_str(" Ada");
+    later.id = "later-ada".into();
+    later.range = ByteRange {
+        start: chunk.document.text.len() - 3,
+        end: chunk.document.text.len(),
+    };
+    chunk.range.end = chunk.document.text.len();
+    prepared.language.content_hash = chunk.document.content_hash();
+    prepared.content_hash = chunk.document.content_hash();
+    prepared.language.mentions.push(later);
+    let mut fact = relation();
+    fact["subject"]["mention_id"] = json!("later-ada");
+    assert!(
+        quality::parse_graph(
+            &json!({"facts":[fact.clone()]}).to_string(),
+            &chunk,
+            &prepared,
+            &config.ontology,
+            &policy,
+            &"c".repeat(64)
+        )?
+        .candidates
+        .is_empty()
+    );
+    policy.align_mentions = true;
+    let graph = quality::parse_graph(
+        &json!({"facts":[fact]}).to_string(),
+        &chunk,
+        &prepared,
+        &config.ontology,
+        &policy,
+        &"c".repeat(64),
+    )?;
+    assert_eq!(graph.candidates.len(), 1);
+    assert_eq!(graph.candidates[0].candidate.subject.mention_id, "ada");
+    assert_eq!(
+        graph.candidates[0]
+            .proposed
+            .as_ref()
+            .unwrap()
+            .subject
+            .mention_id,
+        "later-ada"
+    );
+    assert_eq!(
+        graph
+            .mentions
+            .iter()
+            .find(|m| m.id == "ada")
+            .unwrap()
+            .raw_mention_score,
+        Some(1.0)
+    );
+    Ok(())
+}
+#[test]
+fn quote_anchors_include_original_intervening_bytes_and_reject_ambiguous_bounds() -> Result<()> {
+    let (chunk, prepared, config, mut policy) = fixture()?;
+    let mut fact = relation();
+    fact.as_object_mut().unwrap().remove("quote");
+    fact["quote_start"] = json!("Ada");
+    fact["quote_end"] = json!("approved.");
+    assert!(
+        quality::parse_graph(
+            &json!({"facts":[fact.clone()]}).to_string(),
+            &chunk,
+            &prepared,
+            &config.ontology,
+            &policy,
+            &"c".repeat(64)
+        )?
+        .candidates
+        .is_empty()
+    );
+    policy.quote_anchors = true;
+    let graph = quality::parse_graph(
+        &json!({"facts":[fact.clone()]}).to_string(),
+        &chunk,
+        &prepared,
+        &config.ontology,
+        &policy,
+        &"c".repeat(64),
+    )?;
+    assert_eq!(graph.candidates.len(), 1);
+    assert_eq!(
+        graph.candidates[0].candidate.quote,
+        "Ada manages Company if approved."
+    );
+    assert!(graph.candidates[0].candidate.quote_start.is_none());
+    assert!(
+        graph.candidates[0]
+            .proposed
+            .as_ref()
+            .unwrap()
+            .quote_start
+            .is_some()
+    );
+    let mut mixed = fact.clone();
+    mixed["quote"] = json!("Ada manages Company if approved.");
+    assert!(
+        quality::parse_graph(
+            &json!({"facts":[mixed]}).to_string(),
+            &chunk,
+            &prepared,
+            &config.ontology,
+            &policy,
+            &"c".repeat(64)
+        )?
+        .candidates
+        .is_empty()
+    );
+    fact["quote_start"] = json!("approved.");
+    fact["quote_end"] = json!("Ada");
+    assert!(
+        quality::parse_graph(
+            &json!({"facts":[fact]}).to_string(),
+            &chunk,
+            &prepared,
+            &config.ontology,
+            &policy,
+            &"c".repeat(64)
+        )?
+        .candidates
+        .is_empty()
     );
     Ok(())
 }

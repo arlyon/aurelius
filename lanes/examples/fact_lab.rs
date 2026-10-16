@@ -9,7 +9,7 @@ async fn execute() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.is_empty() || args[0] == "--help" {
         println!(
-            "fact_lab replay --config FILE --input FILE --responses DIR --output NEW_DIR [--records 9,62] [--fresh]\nfact_lab run --live --max-calls N --config FILE --input FILE --output NEW_DIR [--records 9,62] [--fresh] [--batch-adjacent] [--instructions FILE] [--expected FILE] [--model-dir DIR]\nfact_lab compare --before DIR --after DIR\nCached preparation is the default; use --fresh for new records/model settings. Source/proposals/rejections are private local artifacts; no production writes."
+            "fact_lab replay --config FILE --input FILE --responses DIR --output NEW_DIR [--records 9,62] [--fresh]\nfact_lab run --live --max-calls N --config FILE --input FILE --output NEW_DIR [--records 9,62] [--fresh] [--batch-adjacent] [--batch-bytes N] [--instructions FILE] [--expected FILE] [--model-dir DIR]\nfact_lab compare --before DIR --after DIR\nCached preparation is the default; use --fresh for new records/model settings. Source/proposals/rejections are private local artifacts; no production writes."
         );
         return Ok(());
     }
@@ -38,6 +38,7 @@ async fn execute() -> Result<()> {
                         | "--after"
                         | "--expected"
                         | "--model-dir"
+                        | "--batch-bytes"
                 ),
                 "unknown option"
             );
@@ -124,14 +125,20 @@ async fn execute() -> Result<()> {
         selected,
         fresh: switches.contains("--fresh"),
         batch_adjacent: switches.contains("--batch-adjacent"),
+        max_batch_bytes: values
+            .get("--batch-bytes")
+            .map(|value| value.parse())
+            .transpose()?
+            .unwrap_or(4096),
         max_calls: values
             .get("--max-calls")
             .map(|v| v.parse())
             .transpose()?
             .unwrap_or_default(),
     };
-    let summary = fact_lab::run(&config, &records, &options).await?;
-    if let Some(expected) = values.get("--expected") {
+    // Validate the review sidecar before any billable request, but never send it
+    // to the extractor as extra evidence or an answer key.
+    let expectations = if let Some(expected) = values.get("--expected") {
         let mut bytes = Vec::new();
         std::fs::File::open(expected)?
             .take(2 * 1024 * 1024 + 1)
@@ -140,8 +147,15 @@ async fn execute() -> Result<()> {
             bytes.len() <= 2 * 1024 * 1024,
             "expectations exceed byte budget"
         );
-        let expected: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|_| anyhow::anyhow!("invalid expectations JSON"))?;
+        Some(
+            serde_json::from_slice::<serde_json::Value>(&bytes)
+                .map_err(|_| anyhow::anyhow!("invalid expectations JSON"))?,
+        )
+    } else {
+        None
+    };
+    let summary = fact_lab::run(&config, &records, &options).await?;
+    if let Some(expected) = expectations {
         use std::{io::Write, os::unix::fs::OpenOptionsExt};
         let mut file = std::fs::OpenOptions::new()
             .create_new(true)

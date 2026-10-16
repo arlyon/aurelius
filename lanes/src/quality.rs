@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const QUALITY_VERSION: &str = "typed-source-facts-v6";
+pub const QUALITY_VERSION: &str = "typed-source-facts-v11";
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PropertyKind {
@@ -42,6 +42,14 @@ pub struct QualityConfig {
     pub scope_review_relations: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra_instructions: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub align_whitespace: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub quote_anchors: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub align_mentions: bool,
 }
 fn scope_review_relations() -> BTreeSet<String> {
     ["assigned_to"].into_iter().map(String::from).collect()
@@ -63,6 +71,12 @@ fn name(value: &str) -> bool {
 impl QualityConfig {
     pub fn validate(&self, ontology: &Ontology) -> Result<()> {
         ontology.validate()?;
+        if let Some(limit) = self.max_output_tokens {
+            ensure!(
+                (512..=16384).contains(&limit),
+                "invalid typed output token budget"
+            );
+        }
         if let Some(instructions) = &self.extra_instructions {
             ensure!(
                 !instructions.trim().is_empty() && instructions.len() <= 16384,
@@ -146,7 +160,12 @@ pub enum TypedBody {
 pub struct TypedCandidate {
     pub subject: TypedArgument,
     pub body: TypedBody,
+    #[serde(default)]
     pub quote: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote_start: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote_end: Option<String>,
     pub statement_type: StatementType,
     pub polarity: Polarity,
     pub modality: Modality,
@@ -156,6 +175,7 @@ pub struct TypedCandidate {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RejectionReason {
+    InvalidCandidateShape,
     UnknownPredicate,
     UnknownProperty,
     EndpointType,
@@ -182,6 +202,8 @@ pub struct RejectedCandidate {
 #[serde(deny_unknown_fields)]
 pub struct CheckedCandidate {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposed: Option<TypedCandidate>,
     pub candidate: TypedCandidate,
     pub evidence: Vec<SourceSpan>,
 }
@@ -204,7 +226,7 @@ pub struct QualityGraph {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Extraction {
-    facts: Vec<TypedCandidate>,
+    facts: Vec<serde_json::Value>,
 }
 fn overlaps(a: ByteRange, b: ByteRange) -> bool {
     a.start < b.end && b.start < a.end
@@ -417,7 +439,119 @@ fn supported(
     }
     Ok(evidence)
 }
-pub fn parse_proposals(body: &str) -> Result<Vec<TypedCandidate>> {
+fn collapsed(text: &str) -> (String, Vec<(usize, usize)>) {
+    let mut normalized = String::new();
+    let mut offsets = Vec::new();
+    let mut chars = text.char_indices().peekable();
+    while let Some((start, character)) = chars.next() {
+        let mut end = start + character.len_utf8();
+        if character.is_whitespace() {
+            while chars.peek().is_some_and(|(_, next)| next.is_whitespace()) {
+                let (offset, next) = chars.next().expect("peeked character");
+                end = offset + next.len_utf8();
+            }
+            normalized.push(' ');
+            offsets.push((start, end));
+        } else {
+            normalized.push(character);
+            offsets.extend(std::iter::repeat_n((start, end), character.len_utf8()));
+        }
+    }
+    (normalized, offsets)
+}
+// A unique whitespace-equivalent match resolves to ORIGINAL source bytes.
+// Words, case, punctuation, IDs, argument ranges and temporal precision do not change.
+fn source_literal(proposed: &str, source: &str) -> Option<String> {
+    if source.contains(proposed) {
+        return Some(proposed.into());
+    }
+    let (needle, _) = collapsed(proposed);
+    let needle = needle.trim();
+    if needle.is_empty() {
+        return None;
+    }
+    let (haystack, offsets) = collapsed(source);
+    let start = haystack.find(needle)?;
+    let next = start + needle.chars().next()?.len_utf8();
+    if haystack.get(next..)?.contains(needle) {
+        return None;
+    }
+    let range = offsets.get(start)?.0..offsets.get(start + needle.len() - 1)?.1;
+    source.get(range).map(String::from)
+}
+fn unique_literal_range(
+    text: &str,
+    source: &str,
+    whitespace: bool,
+) -> Option<std::ops::Range<usize>> {
+    if text.is_empty() {
+        return None;
+    }
+    let text = if whitespace {
+        source_literal(text, source)?
+    } else {
+        text.to_owned()
+    };
+    let start = source.find(&text)?;
+    let next = start + text.chars().next()?.len_utf8();
+    if source.get(next..)?.contains(&text) {
+        return None;
+    }
+    Some(start..start + text.len())
+}
+fn align_candidate(
+    mut candidate: TypedCandidate,
+    source: &str,
+    config: &QualityConfig,
+) -> TypedCandidate {
+    if config.quote_anchors
+        && candidate.quote.is_empty()
+        && let (Some(start), Some(end)) = (&candidate.quote_start, &candidate.quote_end)
+        && let (Some(start), Some(end)) = (
+            unique_literal_range(start, source, config.align_whitespace),
+            unique_literal_range(end, source, config.align_whitespace),
+        )
+        && end.start >= start.start
+        && end.end >= start.end
+    {
+        candidate.quote = source[start.start..end.end].into();
+        candidate.quote_start = None;
+        candidate.quote_end = None;
+    }
+    if !config.align_whitespace {
+        return candidate;
+    }
+    candidate.quote = source_literal(&candidate.quote, source).unwrap_or(candidate.quote);
+    for qualifier in candidate
+        .qualifiers
+        .adverbs
+        .iter_mut()
+        .chain(candidate.qualifiers.conditions.iter_mut())
+        .chain(candidate.qualifiers.scope.iter_mut())
+    {
+        if let Some(original) = source_literal(qualifier, &candidate.quote) {
+            *qualifier = original;
+        }
+    }
+    if let TypedBody::Property {
+        value, value_quote, ..
+    } = &mut candidate.body
+        && let Some(original) = source_literal(value_quote, &candidate.quote)
+    {
+        match value {
+            PropertyValue::Text { value } if collapsed(value).0 == collapsed(value_quote).0 => {
+                *value = original.clone()
+            }
+            PropertyValue::Time {
+                value: TimeValue::Relative { text },
+            } if collapsed(text).0 == collapsed(value_quote).0 => *text = original.clone(),
+            _ => (),
+        }
+        *value_quote = original;
+    }
+    candidate
+}
+pub fn parse_proposals(body: &str) -> Result<Vec<serde_json::Value>> {
     ensure!(
         body.len() <= 512 * 1024,
         crate::facts::ReviewDiagnostic::ResponseBudget
@@ -429,6 +563,88 @@ pub fn parse_proposals(body: &str) -> Result<Vec<TypedCandidate>> {
         crate::facts::ReviewDiagnostic::CandidateBudget
     );
     Ok(output.facts)
+}
+fn layout_edge(text: &str) -> bool {
+    text.chars()
+        .all(|c| c.is_whitespace() || matches!(c, '●' | '•' | '▪' | '‣'))
+}
+fn align_arguments(
+    mut candidate: TypedCandidate,
+    chunk: &Chunk,
+    prepared: &PreparedFactSource,
+) -> TypedCandidate {
+    let Ok(evidence) = chunk.spans(&candidate.quote) else {
+        return candidate;
+    };
+    if evidence.len() != 1 {
+        return candidate;
+    }
+    let mut range = evidence[0].range;
+    let original_range = range;
+    let mut bind = |argument: &mut TypedArgument| {
+        let Some(original) = prepared
+            .language
+            .mentions
+            .iter()
+            .find(|m| m.id == argument.mention_id && !m.pronoun)
+        else {
+            return;
+        };
+        if original.range.start >= original_range.start && original.range.end <= original_range.end
+        {
+            return;
+        }
+        let clean = |text: &str| {
+            text.trim_matches(|c: char| c.is_whitespace() || matches!(c, '●' | '•' | '▪' | '‣'))
+                .to_owned()
+        };
+        let wanted = clean(&original.text);
+        if wanted.is_empty() {
+            return;
+        }
+        let mut matches = prepared.language.mentions.iter().filter(|m| {
+            if m.pronoun
+                || clean(&m.text) != wanted
+                || m.range.start < chunk.range.start
+                || m.range.end > chunk.range.end
+                || mention_issue(m, prepared, &chunk.document).is_some()
+            {
+                return false;
+            }
+            if m.range.start < original_range.start
+                && !chunk
+                    .document
+                    .text
+                    .get(m.range.start..original_range.start)
+                    .is_some_and(layout_edge)
+            {
+                return false;
+            }
+            if m.range.end > original_range.end
+                && !chunk
+                    .document
+                    .text
+                    .get(original_range.end..m.range.end)
+                    .is_some_and(layout_edge)
+            {
+                return false;
+            }
+            m.range.start < original_range.end && m.range.end > original_range.start
+        });
+        if let Some(actual) = matches.next()
+            && matches.next().is_none()
+        {
+            argument.mention_id = actual.id.clone();
+            range.start = range.start.min(actual.range.start);
+            range.end = range.end.max(actual.range.end);
+        }
+    };
+    bind(&mut candidate.subject);
+    if let TypedBody::Relation { object, .. } = &mut candidate.body {
+        bind(object);
+    }
+    candidate.quote = chunk.document.text[range.start..range.end].into();
+    candidate
 }
 pub fn parse_graph(
     body: &str,
@@ -468,8 +684,33 @@ pub fn parse_graph(
         rejections: Vec::new(),
     };
     let mut seen = BTreeSet::new();
-    for (index, candidate) in proposals.into_iter().enumerate() {
-        let result = if candidate.quote.trim().is_empty() || candidate.quote.len() > 4000 {
+    for (index, raw) in proposals.into_iter().enumerate() {
+        let proposed: TypedCandidate = match serde_json::from_value(raw) {
+            Ok(value) => value,
+            Err(_) => {
+                graph.rejections.push(RejectedCandidate {
+                    index,
+                    reason: RejectionReason::InvalidCandidateShape,
+                });
+                continue;
+            }
+        };
+        let candidate = if config.align_whitespace || config.quote_anchors {
+            align_candidate(proposed.clone(), chunk.text()?, config)
+        } else {
+            proposed.clone()
+        };
+        let candidate = if config.align_mentions {
+            align_arguments(candidate, chunk, prepared)
+        } else {
+            candidate
+        };
+        let changed = serde_json::to_value(&candidate)? != serde_json::to_value(&proposed)?;
+        let result = if candidate.quote_start.is_some()
+            || candidate.quote_end.is_some()
+            || candidate.quote.trim().is_empty()
+            || candidate.quote.len() > 4000
+        {
             Err(RejectionReason::MissingSourceEvidence)
         } else {
             supported(&candidate, chunk, prepared, ontology, config)
@@ -488,6 +729,7 @@ pub fn parse_graph(
                 if seen.insert(id.clone()) {
                     graph.candidates.push(CheckedCandidate {
                         id,
+                        proposed: changed.then_some(proposed),
                         candidate,
                         evidence,
                     });
@@ -520,6 +762,7 @@ const PROMPT: &str = r#"Extract only source-supported, durable business candidat
 Return ONLY {"facts":[...]} with at most 20 items. Every item has exactly subject:{mention_id,entity_type}, body, quote (one exact source substring supporting the entire claim and containing its argument mentions), statement_type (observation|hypothesis|goal|directive|constraint|preference), polarity (positive|negative), modality (asserted|must|should|may), qualifiers:{adverbs:[exact source strings],conditions:[exact source strings],scope:exact source string|null}, validity:{from:time bound|null,to:time bound|null}.
 Relation body: {kind:"relation",predicate:declared name,object:{mention_id,entity_type}}.
 Property body: {kind:"property",property:declared name,value:{kind:"text",value:exact literal}|{kind:"number",value:JSON number}|{kind:"time",value:time value},value_quote:exact literal inside quote}.
+A time-valued property MUST keep the outer kind:"time" wrapper; for example value:{kind:"time",value:{kind:"relative",text:"next Friday"}}. Do not put kind:"relative" or kind:"date" directly at property value level.
 Time bounds: {kind:"date",value:"YYYY-MM-DD"}|{kind:"timestamp",value:explicit-offset RFC3339}|{kind:"month",year:integer,month:integer}. Time values also allow {kind:"relative",text:exact unresolved expression} or {kind:"period",start:time bound,end:time bound,end_inclusive:boolean}. No mixed-precision periods/validity. Unsupported normalizations should be omitted, not fabricated."#;
 pub fn model_input(
     chunk: &Chunk,
@@ -545,8 +788,13 @@ pub fn model_input(
         .as_ref()
         .map(|text| format!("\nAdditional operator instructions:\n{text}"))
         .unwrap_or_default();
+    let anchors = if config.quote_anchors {
+        "\nEvidence format override: use either quote (one exact CONTIGUOUS substring), OR quote_start and quote_end (two short UNIQUE exact phrases marking the start/end of the evidence), never both. The system will include ALL original source bytes between those anchors. Do not stitch nonadjacent lines into a fabricated quote. Anchors must occur in order within source_text. Literal property values/value_quote still need exact source text. Mention IDs identify OCCURRENCES, not canonical entities: select the occurrence inside your evidence, not another occurrence from a coreference group."
+    } else {
+        ""
+    };
     let prompt = format!(
-        "{PROMPT}{extra}\nOntology:\n{}\nProperty vocabulary:\n{}\nMetadata-only relations:\n{}\nScope-review relations (omit):\n{}\nCanonical context (not claim evidence):\n{prefix}",
+        "{PROMPT}{extra}{anchors}\nOntology:\n{}\nProperty vocabulary:\n{}\nMetadata-only relations:\n{}\nScope-review relations (omit):\n{}\nCanonical context (not claim evidence):\n{prefix}",
         serde_json::to_string(ontology)?,
         serde_json::to_string(&config.properties)?,
         serde_json::to_string(&config.metadata_relations)?,
@@ -562,18 +810,50 @@ pub fn model_input(
                 && !mention.pronoun
                 && mention_issue(mention, prepared, &chunk.document).is_none()
         })
+        .map(|mention| serde_json::json!({"id":mention.id,"range":mention.range,"text":mention.text}))
         .collect();
     let mut coreference = prepared.language.coreference_hypotheses.clone();
+    let eligible: BTreeSet<_> = mentions
+        .iter()
+        .filter_map(|mention| mention["id"].as_str())
+        .collect();
     for cluster in &mut coreference {
+        cluster.retain(|id| eligible.contains(id.as_str()));
         cluster.sort();
     }
+    coreference.retain(|cluster| cluster.len() >= 2);
     coreference.sort();
     let input = serde_json::to_string(
         &serde_json::json!({"source_text":chunk.text()?,"source_range":chunk.range,"source_metadata":chunk.document.metadata,"mentions":mentions,"coreference_hypotheses":coreference,"alias_hypotheses":prepared.alias_hypotheses,"provider_layout":prepared.provider_header.as_ref().map(|header| serde_json::json!({"title":header.title,"header_end":header.text.len()}))}),
     )?;
     ensure!(
         prompt.len() <= 128 * 1024 && input.len() <= 128 * 1024,
-        "typed model input exceeds budget"
+        crate::facts::ReviewDiagnostic::InputBudget
     );
     Ok((prompt, input))
+}
+#[cfg(test)]
+mod alignment_tests {
+    use super::{source_literal, unique_literal_range};
+    #[test]
+    fn whitespace_resolution_is_unique_unicode_safe_and_not_lexical_rewriting() {
+        assert_eq!(
+            source_literal("Émilie approved", "Émilie\r\napproved").as_deref(),
+            Some("Émilie\r\napproved")
+        );
+        assert_eq!(
+            source_literal("A B", "A\u{a0}\tB").as_deref(),
+            Some("A\u{a0}\tB")
+        );
+        assert!(source_literal("A B", "A\r\nB / A\tB").is_none());
+        assert!(source_literal("A BC", "AB C").is_none());
+        assert!(source_literal("a \na", "a\ta\ta").is_none());
+        assert!(source_literal("A, B", "A B").is_none());
+        assert!(source_literal("a B", "A B").is_none());
+        assert!(unique_literal_range("a", "a a", false).is_none());
+        assert_eq!(
+            unique_literal_range("Émilie", "x Émilie y", false),
+            Some(2..9)
+        );
+    }
 }

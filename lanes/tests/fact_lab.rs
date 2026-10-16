@@ -107,6 +107,11 @@ fn file_loader_selection_and_batching_preserve_source_boundaries() -> Result<()>
     assert!(fact_lab::units(&loaded, &BTreeSet::from(["missing".into()]), false).is_err());
     let merged = fact_lab::units(&loaded, &BTreeSet::new(), true)?;
     assert_eq!(merged.len(), 1);
+    assert_eq!(
+        fact_lab::units_bounded(&loaded, &BTreeSet::new(), true, 20)?.len(),
+        2
+    );
+    assert!(fact_lab::units_bounded(&loaded, &BTreeSet::new(), true, 0).is_err());
     assert_eq!(merged[0].members, ["000", "001"]);
     assert_eq!(
         merged[0].record.range.text(&merged[0].record.document)?,
@@ -159,6 +164,19 @@ async fn respond(
             axum::Json(json!({"error":"fixture"})),
         );
     }
+    if input["source_text"]
+        .as_str()
+        .unwrap()
+        .contains("fixture-incomplete")
+    {
+        assert_eq!(body["max_output_tokens"], 8192);
+        return (
+            axum::http::StatusCode::OK,
+            axum::Json(
+                json!({"status":"incomplete","usage":{"input_tokens":12,"output_tokens":8192}}),
+            ),
+        );
+    }
     let mentions = input["mentions"].as_array().unwrap();
     let argument = |name: &str, kind: &str| json!({"mention_id":mentions.iter().find(|m|m["text"]==name).expect("actual neural/source mention")["id"],"entity_type":kind});
     let fact = json!({"subject":argument("Alice","person"),"body":{"kind":"relation","predicate":"manages","object":argument("Acme","company")},"quote":"Alice manages Acme.","statement_type":"observation","polarity":"positive","modality":"asserted","qualifiers":{"adverbs":[],"conditions":[],"scope":null},"validity":{"from":null,"to":null}});
@@ -201,6 +219,7 @@ fn options(output: &Path, mode: Mode) -> Options {
         fresh: true,
         batch_adjacent: false,
         max_calls: 1,
+        max_batch_bytes: 4096,
     }
 }
 #[tokio::test]
@@ -279,6 +298,7 @@ async fn file_only_e2e_real_nlp_mock_transport_cap_replay_and_diagnostics() -> R
     assert_eq!(rejected.attempts, 0);
     let saved = std::fs::read_to_string(secret_run.output.join("record-000.json"))?;
     assert!(!saved.contains("fixtureSecretOnly123456"));
+    assert!(!secret_run.output.join("request-000.json").exists());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     let mut batched = options(&temp.path("batched"), Mode::Live);
     batched.batch_adjacent = true;
@@ -302,6 +322,31 @@ async fn file_only_e2e_real_nlp_mock_transport_cap_replay_and_diagnostics() -> R
         1
     );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let mut incomplete = records[..1].to_vec();
+    incomplete[0].document.text = "fixture-incomplete".into();
+    incomplete[0].range = ByteRange {
+        start: 0,
+        end: incomplete[0].document.text.len(),
+    };
+    let mut larger_output = config.clone();
+    larger_output
+        .fact_quality
+        .as_mut()
+        .expect("quality")
+        .max_output_tokens = Some(8192);
+    let incomplete_options = options(&temp.path("incomplete"), Mode::Live);
+    let partial = fact_lab::run(&larger_output, &incomplete, &incomplete_options).await?;
+    assert_eq!(partial.review_units, 1);
+    assert_eq!(partial.attempts, 1);
+    assert_eq!(partial.output_tokens, 8192);
+    assert!(partial.usage_complete);
+    let trace_path = incomplete_options.output.join("failed-output-000.json");
+    assert!(trace_path.exists());
+    assert_eq!(
+        std::fs::metadata(&trace_path)?.permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(serde_json::from_slice::<Value>(&std::fs::read(trace_path)?)?["output"].is_string());
     let mut failure = records.clone();
     for record in &mut failure {
         record.document.text = "provider-down".into();
@@ -313,7 +358,7 @@ async fn file_only_e2e_real_nlp_mock_transport_cap_replay_and_diagnostics() -> R
     assert!(stopped.provider_stopped);
     assert_eq!(stopped.attempts, 1);
     assert_eq!(stopped.not_run, 1);
-    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
     server.abort();
     Ok(())
 }
