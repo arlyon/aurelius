@@ -1,321 +1,297 @@
+use crate::ontology::Ontology;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, path::Path};
+use std::{io::Read, path::Path};
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    pub lanes: Vec<Lane>,
+    pub ontology: Ontology,
+    pub chat: Option<ChatConfig>,
+    pub temporal: Option<TemporalConfig>,
+    pub webhook: Option<crate::notification::WebhookConfig>,
+    pub language: Option<crate::language::LanguageConfig>,
+    pub fact_context: Option<crate::fact_context::FactContextConfig>,
+    pub fact_quality: Option<crate::quality::QualityConfig>,
+    pub xberg: Option<crate::xberg::XbergConfig>,
+    pub storage: Option<crate::storage::StorageConfig>,
+    pub postgres: Option<crate::postgres::PostgresConfig>,
+    pub source: Option<crate::source::SourceConfig>,
+    pub embedding: Option<crate::embedding::EmbeddingConfig>,
+    pub reduction: Option<crate::reduction::ReductionConfig>,
+    #[serde(default)]
+    pub lanes: std::collections::BTreeMap<String, crate::lanes::LaneConfig>,
 }
-
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct Lane {
-    pub name: String,
-    pub organization_id: String,
-    pub connection_id: String,
-    pub bucket: String,
-    pub root: String,
-    pub namespace: Option<String>,
-    pub stream: String,
-    pub id_pointers: Vec<String>,
-    pub text_fields: Vec<String>,
-    pub revision: Revision,
-    pub scope: Scope,
-    pub citation: Citation,
-    pub deleted_pointer: Option<String>,
-    pub mime_type: String,
-    pub mode: Mode,
-    pub enabled: bool,
+pub struct TemporalConfig {
+    pub address: String,
+    pub namespace: String,
+    pub task_queue: String,
+    pub api_key_env: Option<String>,
+    pub client_cert_env: Option<String>,
+    pub client_key_env: Option<String>,
 }
-
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Scope {
-    Connection,
-    Field {
-        pointer: String,
-        allowed_values: Vec<String>,
-    },
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Revision {
-    pub pointer: String,
-    pub envelope: bool,
-    pub unit: RevisionUnit,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Citation {
-    Slack {
-        workspace_url: String,
-        channel_pointer: String,
-        timestamp_pointer: String,
-    },
-    Url {
-        pointers: Vec<String>,
-    },
-    AsanaTask {
-        task_pointer: String,
-    },
-    AsanaStory {
-        story_pointer: String,
-    },
-    None,
-}
-
-#[derive(Clone, Copy, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RevisionUnit {
-    Seconds,
-    Milliseconds,
-    Rfc3339,
-}
-
-#[derive(Clone, Copy, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum Mode {
-    Content,
-    Metadata,
-}
-
-impl Config {
-    pub fn load(path: &Path) -> Result<Self> {
-        let config: Self = serde_json::from_slice(&std::fs::read(path)?)?;
-        config.validate()?;
-        Ok(config)
-    }
-
+impl TemporalConfig {
     pub fn validate(&self) -> Result<()> {
-        let mut names = HashSet::new();
-        let mut streams = HashSet::new();
-        for lane in &self.lanes {
-            ensure!(
-                !lane.name.is_empty() && names.insert(&lane.name),
-                "invalid or duplicate lane"
-            );
-            ensure!(
-                streams.insert((&lane.connection_id, &lane.namespace, &lane.stream)),
-                "duplicate stream mapping"
-            );
-            ensure!(
-                !lane.organization_id.is_empty()
-                    && lane
-                        .organization_id
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '_'),
-                "invalid organization ID"
-            );
-            ensure!(
-                uuid::Uuid::parse_str(&lane.connection_id).is_ok(),
-                "connection must be UUID"
-            );
-            ensure!(!lane.bucket.is_empty(), "bucket required");
-            ensure!(
-                lane.root == format!("orgs/{}/raw/", lane.organization_id),
-                "root must be scoped to organization"
-            );
-            for part in std::iter::once(&lane.stream).chain(lane.namespace.iter()) {
-                ensure!(
-                    !part.is_empty()
-                        && part
-                            .chars()
-                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-                        && part != "."
-                        && part != "..",
-                    "unsafe stream or namespace"
-                );
-            }
-            ensure!(!lane.id_pointers.is_empty(), "identity mapping required");
-            ensure!(
-                lane.mode == Mode::Metadata || !lane.text_fields.is_empty(),
-                "content mapping required"
-            );
-            let mut pointers: Vec<&String> = lane
-                .id_pointers
-                .iter()
-                .chain(&lane.text_fields)
-                .chain([&lane.revision.pointer])
-                .chain(lane.deleted_pointer.iter())
-                .collect();
-            match &lane.scope {
-                Scope::Connection => {}
-                Scope::Field {
-                    pointer,
-                    allowed_values,
-                } => {
-                    pointers.push(pointer);
-                    ensure!(
-                        !lane.enabled || !allowed_values.is_empty(),
-                        "enabled field scope requires explicit values"
-                    );
-                }
-            }
-            match &lane.citation {
-                Citation::Slack {
-                    workspace_url,
-                    channel_pointer,
-                    timestamp_pointer,
-                } => {
-                    let url = reqwest::Url::parse(workspace_url)?;
-                    ensure!(
-                        url.scheme() == "https"
-                            && url.username().is_empty()
-                            && url.password().is_none(),
-                        "invalid Slack URL"
-                    );
-                    pointers.extend([channel_pointer, timestamp_pointer]);
-                }
-                Citation::Url { pointers: urls } => {
-                    ensure!(!urls.is_empty(), "citation mapping required");
-                    pointers.extend(urls);
-                }
-                Citation::AsanaTask { task_pointer } => pointers.push(task_pointer),
-                Citation::AsanaStory { story_pointer } => pointers.push(story_pointer),
-                Citation::None => {
-                    ensure!(lane.mode == Mode::Metadata, "content requires a citation")
-                }
-            }
-            ensure!(
-                pointers.iter().all(|p| p.starts_with('/')),
-                "mappings must be JSON pointers"
-            );
-            ensure!(
-                matches!(
-                    lane.mime_type.as_str(),
-                    "text/plain" | "text/markdown" | "text/html"
-                ),
-                "unsupported record MIME type"
-            );
+        let url = reqwest::Url::parse(&self.address)?;
+        ensure!(
+            url.scheme() == "https"
+                || (url.scheme() == "http"
+                    && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))),
+            "Temporal address requires TLS or loopback HTTP"
+        );
+        ensure!(
+            url.username().is_empty()
+                && url.password().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none(),
+            "invalid Temporal address"
+        );
+        ensure!(
+            self.client_cert_env.is_some() == self.client_key_env.is_some(),
+            "Temporal mTLS requires both certificate and key references"
+        );
+        for name in self
+            .api_key_env
+            .iter()
+            .chain(self.client_cert_env.iter())
+            .chain(self.client_key_env.iter())
+        {
+            validate_env_name(name)?;
+            ensure!(url.scheme() == "https", "Temporal credentials require TLS");
         }
-        for left in &self.lanes {
-            for right in &self.lanes {
-                ensure!(
-                    left.connection_id != right.connection_id
-                        || (left.organization_id == right.organization_id
-                            && left.bucket == right.bucket),
-                    "connection registered to multiple tenants or buckets"
-                );
-            }
+        for value in [&self.namespace, &self.task_queue] {
+            ensure!(
+                !value.trim().is_empty()
+                    && value.len() <= 200
+                    && !value.chars().any(char::is_control),
+                "invalid Temporal worker identity"
+            );
         }
         Ok(())
     }
-
-    pub fn connection(&self, id: &str) -> Result<Vec<&Lane>> {
-        let lanes: Vec<_> = self
-            .lanes
-            .iter()
-            .filter(|lane| lane.connection_id == id && lane.enabled)
-            .collect();
-        ensure!(!lanes.is_empty(), "unknown or disabled connection");
-        Ok(lanes)
-    }
-    pub fn lane(&self, name: &str) -> Result<&Lane> {
-        self.lanes
-            .iter()
-            .find(|lane| lane.name == name && lane.enabled)
-            .context("unknown or disabled lane")
-    }
 }
-
-impl Lane {
-    pub fn batch_prefix(&self, sync_id: i64) -> Result<String> {
-        ensure!(sync_id > 0, "invalid sync ID");
-        let namespace = self
-            .namespace
-            .as_ref()
-            .map(|n| format!("{n}/"))
-            .unwrap_or_default();
-        Ok(format!(
-            "{}{}/{namespace}{}/",
-            self.root, sync_id, self.stream
-        ))
-    }
-    pub fn fingerprint(&self) -> Result<String> {
-        Ok(blake3::hash(&serde_json::to_vec(self)?)
-            .to_hex()
-            .to_string())
-    }
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatConfig {
+    pub endpoint: String,
+    pub model: String,
+    pub revision: String,
+    // Configuration names an environment variable; credentials never enter workflow payloads.
+    pub api_key_env: Option<String>,
+    #[serde(default)]
+    pub api: ChatApi,
+    pub gateway: Option<GatewayConfig>,
+    #[serde(default)]
+    pub references: crate::references::ReferenceConfig,
 }
-
-#[cfg(test)]
-pub mod tests {
-    use super::*;
-    pub fn fixture() -> Lane {
-        Lane {
-            name: "demo".into(),
-            organization_id: "org_demo".into(),
-            connection_id: "11111111-1111-4111-8111-111111111111".into(),
-            bucket: "demo".into(),
-            root: "orgs/org_demo/raw/".into(),
-            namespace: None,
-            stream: "messages".into(),
-            id_pointers: vec!["/channel_id".into(), "/ts".into()],
-            text_fields: vec!["/text".into()],
-            revision: Revision {
-                pointer: "/ts".into(),
-                envelope: false,
-                unit: RevisionUnit::Seconds,
-            },
-            scope: Scope::Field {
-                pointer: "/channel_id".into(),
-                allowed_values: vec!["CDEMO".into()],
-            },
-            citation: Citation::Slack {
-                workspace_url: "https://demo.slack.com".into(),
-                channel_pointer: "/channel_id".into(),
-                timestamp_pointer: "/ts".into(),
-            },
-            deleted_pointer: None,
-            mime_type: "text/plain".into(),
-            mode: Mode::Content,
-            enabled: true,
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatApi {
+    #[default]
+    ChatCompletions,
+    Responses,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayConfig {
+    pub token_env: String,
+    pub byok_alias: Option<String>,
+}
+impl Config {
+    pub fn load(path: &Path) -> Result<Self> {
+        let mut text = String::new();
+        std::fs::File::open(path)?
+            .take(128 * 1024 + 1)
+            .read_to_string(&mut text)?;
+        ensure!(text.len() <= 128 * 1024, "configuration exceeds bound");
+        Self::parse(&text)
+    }
+    pub fn parse(text: &str) -> Result<Self> {
+        ensure!(text.len() <= 128 * 1024, "configuration exceeds bound");
+        let config: Self = toml::from_str(text).context("invalid knowledge TOML")?;
+        config.validate()?;
+        Ok(config)
+    }
+    pub fn lane_request(&self, name: &str) -> Result<crate::lanes::LaneRequest> {
+        let lane = self.lanes.get(name).context("unknown lane")?;
+        let embedding = self.embedding.as_ref().map(|e| {
+            (
+                &e.model,
+                &e.revision,
+                e.native_dimensions,
+                e.dimensions,
+                e.token_limit,
+            )
+        });
+        let signature = serde_json::to_vec(&(
+            (
+                &lane.scope,
+                &lane.connection,
+                lane.normalizer,
+                &lane.bucket,
+                &lane.raw_prefix,
+                &lane.streams,
+                &lane.citation_base,
+            ),
+            self.ontology.semantic_hash()?,
+            embedding,
+            "canonical-pg-ingestion-v1",
+        ))?;
+        Ok(crate::lanes::LaneRequest {
+            lane: name.into(),
+            profile: blake3::hash(&signature).to_hex().to_string(),
+        })
+    }
+    pub fn validate(&self) -> Result<()> {
+        self.ontology.validate()?;
+        if let Some(chat) = &self.chat {
+            chat.validate()?;
         }
+        if let Some(temporal) = &self.temporal {
+            temporal.validate()?;
+        }
+        if let Some(webhook) = &self.webhook {
+            webhook.validate()?;
+            ensure!(
+                self.temporal.is_some() && self.postgres.is_some() && self.source.is_some(),
+                "webhook requires Temporal, Postgres and source API configuration"
+            );
+            let connections: std::collections::BTreeSet<_> =
+                self.lanes.values().map(|lane| &lane.connection).collect();
+            ensure!(
+                connections.len() == self.lanes.len(),
+                "webhook connection maps to more than one lane"
+            );
+        }
+        if let Some(xberg) = &self.xberg {
+            xberg.validate()?;
+        }
+        if let Some(storage) = &self.storage {
+            storage.validate()?;
+        }
+        if let Some(postgres) = &self.postgres {
+            postgres.validate()?;
+        }
+        if let Some(language) = &self.language {
+            language.validate()?;
+        }
+        if let Some(context) = &self.fact_context {
+            context.validate()?;
+        }
+        if let Some(quality) = &self.fact_quality {
+            quality.validate(&self.ontology)?;
+            ensure!(
+                self.language.is_some() && self.fact_context.is_some(),
+                "typed fact extraction requires local language and canonical context configuration"
+            );
+        }
+        if let Some(source) = &self.source {
+            source.validate()?;
+        }
+        if let Some(embedding) = &self.embedding {
+            embedding.validate()?;
+        }
+        if let Some(reduction) = &self.reduction {
+            reduction.validate()?;
+        }
+        ensure!(self.lanes.len() <= 100, "too many lanes");
+        for (name, lane) in &self.lanes {
+            ensure!(
+                !name.is_empty()
+                    && name.len() <= 100
+                    && name
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-')),
+                "invalid lane name"
+            );
+            lane.validate()?;
+        }
+        Ok(())
     }
-    #[test]
-    fn exact_batch_scope() {
-        assert_eq!(
-            fixture().batch_prefix(12).unwrap(),
-            "orgs/org_demo/raw/12/messages/"
-        );
-        assert!(fixture().batch_prefix(-1).is_err());
-    }
-    #[test]
-    fn reject_cross_org_root_and_unscoped_lane() {
-        let mut lane = fixture();
-        lane.root = "orgs/other/raw/".into();
-        assert!(Config { lanes: vec![lane] }.validate().is_err());
-        let mut lane = fixture();
-        lane.scope = Scope::Field {
-            pointer: "/channel_id".into(),
-            allowed_values: vec![],
-        };
-        assert!(Config { lanes: vec![lane] }.validate().is_err());
-    }
-    #[test]
-    fn multi_stream_not_multi_tenant() {
-        let first = fixture();
-        let mut second = fixture();
-        second.name = "other".into();
-        second.stream = "threads".into();
-        assert!(
-            Config {
-                lanes: vec![first.clone(), second.clone()]
+}
+impl ChatConfig {
+    pub fn validate(&self) -> Result<reqwest::Url> {
+        self.references.validate()?;
+        if let Some(gateway) = &self.gateway {
+            validate_env_name(&gateway.token_env)?;
+            ensure!(
+                self.api_key_env.is_none(),
+                "gateway BYOK cannot also supply provider credentials"
+            );
+            if let Some(alias) = &gateway.byok_alias {
+                ensure!(
+                    !alias.trim().is_empty()
+                        && alias.len() <= 100
+                        && alias
+                            .bytes()
+                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.')),
+                    "invalid gateway key alias"
+                );
             }
-            .validate()
-            .is_ok()
+        }
+        let endpoint = reqwest::Url::parse(&self.endpoint)?;
+        ensure!(
+            endpoint.scheme() == "https"
+                || (endpoint.scheme() == "http"
+                    && matches!(
+                        endpoint.host_str(),
+                        Some("localhost" | "127.0.0.1" | "[::1]")
+                    )),
+            "chat endpoint requires HTTPS or loopback HTTP"
         );
-        second.organization_id = "org_other".into();
-        second.root = "orgs/org_other/raw/".into();
-        assert!(
-            Config {
-                lanes: vec![first, second]
-            }
-            .validate()
-            .is_err()
+        ensure!(
+            endpoint.username().is_empty()
+                && endpoint.password().is_none()
+                && endpoint.query().is_none()
+                && endpoint.fragment().is_none(),
+            "credentials must not be embedded in endpoint"
         );
+        if self.gateway.is_some() {
+            ensure!(
+                (endpoint.scheme() == "https"
+                    && endpoint.host_str() == Some("gateway.ai.cloudflare.com"))
+                    || matches!(
+                        endpoint.host_str(),
+                        Some("localhost" | "127.0.0.1" | "[::1]")
+                    ),
+                "gateway credentials require the Cloudflare gateway host or loopback"
+            );
+        }
+        for value in [&self.model, &self.revision] {
+            ensure!(
+                !value.trim().is_empty()
+                    && value.len() <= 200
+                    && !value.chars().any(char::is_control),
+                "model and immutable revision required"
+            );
+        }
+        if let Some(name) = &self.api_key_env {
+            validate_env_name(name)?;
+        }
+        Ok(endpoint)
     }
+}
+pub(crate) fn validate_env_name(name: &str) -> Result<()> {
+    ensure!(
+        !name.is_empty()
+            && name.len() <= 100
+            && name
+                .bytes()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
+            && !name.as_bytes()[0].is_ascii_digit(),
+        "invalid credential environment reference"
+    );
+    Ok(())
+}
+pub(crate) fn credential(name: &str) -> Result<String> {
+    validate_env_name(name)?;
+    let value =
+        std::env::var(name).map_err(|_| anyhow::anyhow!("missing or invalid credential"))?;
+    ensure!(
+        !value.trim().is_empty() && value.len() <= 64 * 1024,
+        "invalid credential size"
+    );
+    Ok(value)
 }

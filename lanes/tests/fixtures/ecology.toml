@@ -1,0 +1,14 @@
+[ontology]
+id = "ecology"
+version = "2026.1"
+
+[ontology.entities.species]
+description = "A biological species"
+
+[ontology.entities.habitat]
+description = "A habitat where a species may occur"
+
+[ontology.predicates.inhabits]
+description = "A species occurs in a habitat"
+subject_types = ["species"]
+object_types = ["habitat"]

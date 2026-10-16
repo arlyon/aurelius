@@ -1,0 +1,1689 @@
+//! BERT-based NER using ONNX Runtime.
+//!
+//! ONNX-based NER backend using standard
+//! BERT models fine-tuned for token classification (BIO tags).
+//!
+//! Unlike GLiNER which has ONNX export issues, this uses properly exported
+//! BERT NER models like `protectai/bert-base-NER-onnx`.
+//!
+//! ## Default Model
+//!
+//! Uses `protectai/bert-base-NER-onnx` which recognizes:
+//! - PER (Person)
+//! - ORG (Organization)
+//! - LOC (Location)
+//! - MISC (Miscellaneous)
+
+#![allow(missing_docs)] // BIO decoding internals; public API is documented
+#![allow(clippy::manual_strip)] // Complex BIO tag parsing
+
+use crate::{Entity, Error, Language, Result};
+#[cfg(feature = "onnx")]
+use crate::{EntityCategory, EntityType};
+
+#[cfg(feature = "onnx")]
+use {ndarray::Array2, ort::session::Session, std::collections::HashMap, tokenizers::Tokenizer};
+
+/// Configuration for BERT NER model loading.
+#[cfg(feature = "onnx")]
+#[derive(Debug, Clone)]
+pub struct BertNERConfig {
+    /// Prefer quantized models (INT8) for faster CPU inference.
+    pub prefer_quantized: bool,
+    /// ONNX optimization level (1-3, default 3).
+    pub optimization_level: u8,
+    /// Number of threads for inference (0 = auto).
+    pub num_threads: usize,
+}
+
+/// The exact local artifacts used by a loaded [`BertNEROnnx`] model.
+///
+/// These paths are captured when the model is constructed. They are useful for
+/// reproducible evaluation receipts: callers can hash the returned files
+/// without guessing which Hugging Face cache entry was selected. The paths are
+/// local implementation details and may cease to exist if a cache is cleaned.
+#[cfg(feature = "onnx")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BertNerArtifactPaths {
+    /// The ONNX graph passed to ONNX Runtime, including the selected quantized
+    /// graph when one was available.
+    pub graph: std::path::PathBuf,
+    /// The tokenizer JSON used to construct input IDs and offsets.
+    pub tokenizer: std::path::PathBuf,
+    /// The model configuration that supplied the label mapping, when one was
+    /// selected. Local models without `config.json` use the documented
+    /// CoNLL-03 fallback and must not claim a nonexistent artifact.
+    pub config: Option<std::path::PathBuf>,
+}
+
+/// A content-addressed BERT artifact used for one diagnostic trace.
+#[cfg(feature = "onnx")]
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct BertNerTraceArtifact {
+    /// The exact local file that was hashed.
+    pub path: std::path::PathBuf,
+    /// SHA-256 of the file bytes at trace time.
+    pub sha256: String,
+}
+
+/// Content-addressed artifacts used by a [`BertNerTrace`].
+#[cfg(feature = "onnx")]
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct BertNerTraceArtifacts {
+    /// The ONNX graph executed by the trace.
+    pub graph: BertNerTraceArtifact,
+    /// The tokenizer used to create trace inputs.
+    pub tokenizer: BertNerTraceArtifact,
+    /// The configuration used for label mapping, if one was selected.
+    pub config: Option<BertNerTraceArtifact>,
+}
+
+/// A single-window BERT inference trace for parity diagnostics.
+///
+/// This is deliberately a diagnostic record rather than a second extraction
+/// API. It makes the tokenizer inputs, raw graph output, selected labels, and
+/// decoded spans inspectable when comparing anno with another ONNX Runtime
+/// host. Long inputs are rejected so the trace always corresponds to exactly
+/// one graph invocation.
+#[cfg(feature = "onnx")]
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BertNerTrace {
+    /// Content hashes of the exact graph, tokenizer, and configuration used.
+    ///
+    /// Parity comparators must require these values to match before treating
+    /// tokenizer or logits agreement as evidence about the implementation.
+    pub artifacts: BertNerTraceArtifacts,
+    /// Input IDs passed to the graph, including special tokens.
+    pub input_ids: Vec<u32>,
+    /// Attention mask passed to the graph.
+    pub attention_mask: Vec<u32>,
+    /// Segment IDs passed to the graph when it declares `token_type_ids`.
+    ///
+    /// anno supplies zeros for its single-sequence BERT requests.
+    pub token_type_ids: Option<Vec<u32>>,
+    /// Tokenizer token strings in graph order.
+    pub tokens: Vec<String>,
+    /// UTF-8 byte offsets in the input text for each token.
+    pub offsets: Vec<(usize, usize)>,
+    /// Fast-tokenizer word IDs in graph order.
+    pub word_ids: Vec<Option<u32>>,
+    /// Graph logits, shaped `[sequence][label]` for the sole batch item.
+    pub logits: Vec<Vec<f32>>,
+    /// Argmax label selected for each token.
+    pub labels: Vec<String>,
+    /// Decoded anno entities for the same graph output.
+    pub entities: Vec<BertNerTraceEntity>,
+}
+
+/// An entity in a [`BertNerTrace`].
+#[cfg(feature = "onnx")]
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+pub struct BertNerTraceEntity {
+    /// Extracted surface text.
+    pub text: String,
+    /// Start character offset.
+    pub start: usize,
+    /// End character offset.
+    pub end: usize,
+    /// Canonical anno entity type.
+    pub entity_type: String,
+    /// Confidence retained by anno's BIO decoder.
+    pub confidence: f64,
+}
+
+#[cfg(feature = "onnx")]
+impl Default for BertNERConfig {
+    fn default() -> Self {
+        Self {
+            prefer_quantized: true,
+            optimization_level: 3,
+            num_threads: 4,
+        }
+    }
+}
+
+/// BERT-based NER using ONNX Runtime.
+///
+/// Uses standard BERT models fine-tuned for NER with BIO tagging scheme.
+/// Thread-safe with `Arc<Tokenizer>` for efficient sharing.
+#[cfg(feature = "onnx")]
+pub struct BertNEROnnx {
+    session: std::sync::Mutex<Session>,
+    /// Arc-wrapped tokenizer for cheap cloning across threads.
+    tokenizer: std::sync::Arc<Tokenizer>,
+    id_to_label: HashMap<usize, String>,
+    label_to_entity_type: HashMap<String, EntityType>,
+    model_name: String,
+    /// Whether a quantized model was loaded.
+    is_quantized: bool,
+    artifact_paths: BertNerArtifactPaths,
+}
+
+/// Decide whether a BIO tag continues the entity currently being decoded.
+///
+/// A beginning tag may only extend an existing entity for another subword of
+/// the same lexical word. An inside tag continues only an equal entity type;
+/// comparing enum discriminants would incorrectly merge distinct `Custom`
+/// labels because they share the same variant.
+#[cfg(feature = "onnx")]
+fn continues_bio_entity(
+    bio: &str,
+    is_subword_continuation: bool,
+    current_type: Option<&EntityType>,
+    next_type: &EntityType,
+) -> bool {
+    match bio {
+        "B" => is_subword_continuation,
+        "I" => current_type.is_some_and(|current| current == next_type),
+        _ => false,
+    }
+}
+
+#[cfg(feature = "onnx")]
+impl BertNEROnnx {
+    /// Create a new BERT NER ONNX model with default config.
+    ///
+    /// # Arguments
+    /// * `model_name` - HuggingFace model identifier (e.g., "protectai/bert-base-NER-onnx")
+    ///
+    /// # Returns
+    /// BERT NER ONNX model instance
+    pub fn new(model_name: &str) -> Result<Self> {
+        Self::with_config(model_name, BertNERConfig::default())
+    }
+
+    /// Create a new BERT NER ONNX model with custom configuration.
+    ///
+    /// # Arguments
+    /// * `model_name` - HuggingFace model identifier or local directory path
+    /// * `config` - Configuration for model loading
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let config = BertNERConfig {
+    ///     prefer_quantized: true,  // Use INT8 model for 2-4x speedup
+    ///     optimization_level: 3,
+    ///     num_threads: 8,
+    /// };
+    /// let model = BertNEROnnx::with_config("protectai/bert-base-NER-onnx", config)?;
+    /// ```
+    pub fn with_config(model_name: &str, config: BertNERConfig) -> Result<Self> {
+        // If model_name is a local directory, load directly from it.
+        let local_path = std::path::Path::new(model_name);
+        if local_path.is_dir() {
+            return Self::from_local(local_path, config);
+        }
+
+        use crate::backends::hf_loader;
+
+        let api = hf_loader::hf_api()?;
+        let repo = api.model(model_name.to_string());
+
+        // Download model - try quantized first if preferred
+        let (model_path, is_quantized) =
+            hf_loader::download_onnx_model(&repo, config.prefer_quantized)?;
+
+        let tokenizer_path = hf_loader::download_model_file(&repo, &["tokenizer.json"])?;
+        let config_path = hf_loader::download_model_file(&repo, &["config.json"])?;
+
+        let tokenizer = Self::load_untruncated_tokenizer(&tokenizer_path)?;
+
+        // Load config and extract id2label mapping
+        let config_str = std::fs::read_to_string(&config_path)
+            .map_err(|e| Error::Retrieval(format!("Failed to read config.json: {}", e)))?;
+        let config_json: serde_json::Value = serde_json::from_str(&config_str)
+            .map_err(|e| Error::Parse(format!("Failed to parse config.json: {}", e)))?;
+
+        // Build label mappings
+        let id_to_label = Self::build_id_to_label(&config_json);
+        let label_to_entity_type = Self::build_label_to_entity_type();
+
+        let session = hf_loader::create_onnx_session(
+            &model_path,
+            hf_loader::OnnxSessionConfig {
+                optimization_level: config.optimization_level,
+                num_threads: config.num_threads,
+                use_cpu_provider: false,
+                ..Default::default()
+            },
+        )?;
+
+        Ok(Self {
+            session: std::sync::Mutex::new(session),
+            tokenizer: std::sync::Arc::new(tokenizer),
+            id_to_label,
+            label_to_entity_type,
+            model_name: model_name.to_string(),
+            is_quantized,
+            artifact_paths: BertNerArtifactPaths {
+                graph: model_path,
+                tokenizer: tokenizer_path,
+                config: Some(config_path),
+            },
+        })
+    }
+
+    /// Load from a local directory containing `model.onnx`, `tokenizer.json`, and `config.json`.
+    fn from_local(dir: &std::path::Path, config: BertNERConfig) -> Result<Self> {
+        use crate::backends::hf_loader;
+
+        let model_path = if config.prefer_quantized && dir.join("model_quantized.onnx").exists() {
+            dir.join("model_quantized.onnx")
+        } else {
+            dir.join("model.onnx")
+        };
+        if !model_path.exists() {
+            return Err(Error::Retrieval(format!(
+                "model.onnx not found in {}",
+                dir.display()
+            )));
+        }
+
+        let is_quantized = model_path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().contains("quantized"));
+
+        let tokenizer_path = dir.join("tokenizer.json");
+        if !tokenizer_path.exists() {
+            return Err(Error::Retrieval(format!(
+                "tokenizer.json not found in {}",
+                dir.display()
+            )));
+        }
+        let tokenizer = Self::load_untruncated_tokenizer(&tokenizer_path)?;
+
+        let config_path = dir.join("config.json");
+        let selected_config = config_path.exists().then_some(config_path);
+        let (id_to_label, label_to_entity_type) =
+            if let Some(config_path) = selected_config.as_ref() {
+                let config_str = std::fs::read_to_string(config_path)
+                    .map_err(|e| Error::Retrieval(format!("Failed to read config.json: {}", e)))?;
+                let config_json: serde_json::Value = serde_json::from_str(&config_str)
+                    .map_err(|e| Error::Parse(format!("Failed to parse config.json: {}", e)))?;
+                (
+                    Self::build_id_to_label(&config_json),
+                    Self::build_label_to_entity_type(),
+                )
+            } else {
+                // Fallback: CoNLL-03 defaults
+                let mut map = HashMap::new();
+                map.insert(0, "O".to_string());
+                map.insert(1, "B-MISC".to_string());
+                map.insert(2, "I-MISC".to_string());
+                map.insert(3, "B-PER".to_string());
+                map.insert(4, "I-PER".to_string());
+                map.insert(5, "B-ORG".to_string());
+                map.insert(6, "I-ORG".to_string());
+                map.insert(7, "B-LOC".to_string());
+                map.insert(8, "I-LOC".to_string());
+                (map, Self::build_label_to_entity_type())
+            };
+
+        let session = hf_loader::create_onnx_session(
+            &model_path,
+            hf_loader::OnnxSessionConfig {
+                optimization_level: config.optimization_level,
+                num_threads: config.num_threads,
+                use_cpu_provider: false,
+                ..Default::default()
+            },
+        )?;
+
+        Ok(Self {
+            session: std::sync::Mutex::new(session),
+            tokenizer: std::sync::Arc::new(tokenizer),
+            id_to_label,
+            label_to_entity_type,
+            model_name: dir.display().to_string(),
+            is_quantized,
+            artifact_paths: BertNerArtifactPaths {
+                graph: model_path,
+                tokenizer: tokenizer_path,
+                config: selected_config,
+            },
+        })
+    }
+
+    /// Check if a quantized model was loaded.
+    #[must_use]
+    pub fn is_quantized(&self) -> bool {
+        self.is_quantized
+    }
+
+    /// Get a clone of the tokenizer Arc (cheap).
+    #[must_use]
+    pub fn tokenizer(&self) -> std::sync::Arc<Tokenizer> {
+        std::sync::Arc::clone(&self.tokenizer)
+    }
+
+    /// Load an artifact tokenizer but disable its serialized truncation rule.
+    ///
+    /// BERT's tokenizer snapshot commonly serializes a 512-token limit. anno
+    /// needs to observe the complete input before it can select sentence or
+    /// token windows itself; retaining that rule would silently truncate the
+    /// probe and bypass chunking.
+    fn load_untruncated_tokenizer(path: &std::path::Path) -> Result<Tokenizer> {
+        use crate::backends::hf_loader;
+
+        let mut tokenizer = hf_loader::load_tokenizer(path)?;
+        tokenizer.with_truncation(None).map_err(|error| {
+            Error::Parse(format!(
+                "Failed to disable serialized tokenizer truncation for {}: {error}",
+                path.display()
+            ))
+        })?;
+        Ok(tokenizer)
+    }
+
+    fn encode_untruncated(&self, text: &str) -> Result<tokenizers::Encoding> {
+        self.tokenizer
+            .encode(text, true)
+            .map_err(|error| Error::Parse(format!("Failed to tokenize input: {error}")))
+    }
+
+    /// Return the exact local files selected while this model was constructed.
+    ///
+    /// This does not discover cache entries or touch the network. Consumers
+    /// that write evaluation receipts should hash these paths at the time of
+    /// the run and record a missing file explicitly.
+    #[must_use]
+    pub fn artifact_paths(&self) -> &BertNerArtifactPaths {
+        &self.artifact_paths
+    }
+
+    /// Hash the exact artifacts selected by this model for a parity trace.
+    fn trace_artifacts(&self) -> Result<BertNerTraceArtifacts> {
+        use sha2::{Digest, Sha256};
+        use std::io::Read;
+
+        fn hash(path: &std::path::Path) -> Result<BertNerTraceArtifact> {
+            let mut source = std::fs::File::open(path).map_err(|error| {
+                Error::Retrieval(format!(
+                    "Failed to open BERT trace artifact {}: {error}",
+                    path.display()
+                ))
+            })?;
+            let mut digest = Sha256::new();
+            let mut buffer = [0_u8; 8192];
+            loop {
+                let read = source.read(&mut buffer).map_err(|error| {
+                    Error::Retrieval(format!(
+                        "Failed to read BERT trace artifact {}: {error}",
+                        path.display()
+                    ))
+                })?;
+                if read == 0 {
+                    break;
+                }
+                digest.update(&buffer[..read]);
+            }
+            Ok(BertNerTraceArtifact {
+                path: path.to_path_buf(),
+                sha256: digest
+                    .finalize()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect(),
+            })
+        }
+
+        Ok(BertNerTraceArtifacts {
+            graph: hash(&self.artifact_paths.graph)?,
+            tokenizer: hash(&self.artifact_paths.tokenizer)?,
+            config: self
+                .artifact_paths
+                .config
+                .as_deref()
+                .map(hash)
+                .transpose()?,
+        })
+    }
+
+    /// Build id_to_label mapping from config.
+    fn build_id_to_label(config_json: &serde_json::Value) -> HashMap<usize, String> {
+        let mut map = HashMap::new();
+        if let Some(id2label) = config_json.get("id2label") {
+            if let Some(obj) = id2label.as_object() {
+                for (id_str, label_value) in obj {
+                    if let (Ok(id), Some(label)) = (id_str.parse::<usize>(), label_value.as_str()) {
+                        map.insert(id, label.to_string());
+                    }
+                }
+            }
+        }
+        // Fallback for CoNLL-03 format
+        if map.is_empty() {
+            map.insert(0, "O".to_string());
+            map.insert(1, "B-MISC".to_string());
+            map.insert(2, "I-MISC".to_string());
+            map.insert(3, "B-PER".to_string());
+            map.insert(4, "I-PER".to_string());
+            map.insert(5, "B-ORG".to_string());
+            map.insert(6, "I-ORG".to_string());
+            map.insert(7, "B-LOC".to_string());
+            map.insert(8, "I-LOC".to_string());
+        }
+        map
+    }
+
+    /// Build label_to_entity_type mapping for common NER labels.
+    fn build_label_to_entity_type() -> HashMap<String, EntityType> {
+        let mut map = HashMap::new();
+        // Standard CoNLL-03 labels
+        map.insert("B-PER".to_string(), EntityType::Person);
+        map.insert("I-PER".to_string(), EntityType::Person);
+        map.insert("B-ORG".to_string(), EntityType::Organization);
+        map.insert("I-ORG".to_string(), EntityType::Organization);
+        map.insert("B-LOC".to_string(), EntityType::Location);
+        map.insert("I-LOC".to_string(), EntityType::Location);
+        map.insert(
+            "B-MISC".to_string(),
+            EntityType::custom("misc", EntityCategory::Misc),
+        );
+        map.insert(
+            "I-MISC".to_string(),
+            EntityType::custom("misc", EntityCategory::Misc),
+        );
+        // Alternative formats
+        map.insert("PER".to_string(), EntityType::Person);
+        map.insert("ORG".to_string(), EntityType::Organization);
+        map.insert("LOC".to_string(), EntityType::Location);
+        map.insert(
+            "MISC".to_string(),
+            EntityType::custom("misc", EntityCategory::Misc),
+        );
+        map
+    }
+
+    /// Extract entities from text using BERT NER.
+    ///
+    /// # Arguments
+    /// * `text` - Text to extract entities from
+    /// * `_language` - Optional language hint (unused, model handles multiple languages)
+    ///
+    /// # Returns
+    /// Vector of NER entities with positions, types, and confidence scores
+    /// Maximum tokens per BERT chunk (512 model limit minus [CLS] and [SEP]).
+    const MAX_TOKENS: usize = 510;
+    /// Token overlap used only when a single sentence exceeds BERT's window.
+    const HARD_CHUNK_OVERLAP_TOKENS: usize = 32;
+
+    pub fn extract_entities(&self, text: &str, _language: Option<Language>) -> Result<Vec<Entity>> {
+        if text.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Check if text exceeds BERT's 512 token limit; if so, split into
+        // sentence-boundary chunks and merge results.
+        let probe = self.encode_untruncated(text)?;
+        if probe.get_ids().len() > Self::MAX_TOKENS + 2 {
+            return self.extract_entities_chunked(text);
+        }
+
+        self.extract_entities_single(text, &probe)
+    }
+
+    /// Split long text into sentence-boundary chunks that fit within BERT's
+    /// 512-token window, run each chunk, and merge entity results.
+    ///
+    /// Uses 1-sentence overlap between consecutive chunks so entities near
+    /// chunk boundaries get a second chance with surrounding context. Entities
+    /// from the overlap region are deduplicated by (start, end, type).
+    fn extract_entities_chunked(&self, text: &str) -> Result<Vec<Entity>> {
+        // First, find all sentence boundaries (byte offsets after '.', '!', '?', '\n').
+        let mut sentence_ends: Vec<usize> = Vec::new();
+        for (i, c) in text.char_indices() {
+            if matches!(c, '.' | '!' | '?' | '\n') {
+                sentence_ends.push(i + c.len_utf8());
+            }
+        }
+        if sentence_ends.is_empty() || *sentence_ends.last().unwrap() < text.len() {
+            sentence_ends.push(text.len());
+        }
+
+        // Build chunks: each chunk is (byte_start, byte_end). We greedily pack
+        // sentences until the next one would exceed MAX_TOKENS, then start a new
+        // chunk. The new chunk begins 1 sentence *before* the split point
+        // (overlap) so cross-boundary entities get full context on both sides.
+        let mut chunks: Vec<(usize, usize)> = Vec::new();
+        let mut chunk_start_byte = 0usize;
+        let mut prev_boundary_idx: Option<usize> = None; // index into sentence_ends
+
+        for (sent_idx, &sent_end) in sentence_ends.iter().enumerate() {
+            let candidate = &text[chunk_start_byte..sent_end];
+            let tok = self.encode_untruncated(candidate)?;
+
+            if tok.get_ids().len() > Self::MAX_TOKENS + 2 {
+                // This sentence pushes over the limit. Flush up to the previous boundary.
+                if let Some(prev_idx) = prev_boundary_idx {
+                    let flush_end = sentence_ends[prev_idx];
+                    chunks.push((chunk_start_byte, flush_end));
+                    // Overlap: start new chunk 1 sentence back (if possible)
+                    chunk_start_byte = if prev_idx > 0 {
+                        sentence_ends[prev_idx - 1]
+                    } else {
+                        flush_end
+                    };
+                } else {
+                    // Single sentence exceeds limit -- flush it anyway
+                    chunks.push((chunk_start_byte, sent_end));
+                    chunk_start_byte = sent_end;
+                }
+            }
+            prev_boundary_idx = Some(sent_idx);
+        }
+        // Flush remaining text
+        if chunk_start_byte < text.len() {
+            chunks.push((chunk_start_byte, text.len()));
+        }
+        if chunks.is_empty() {
+            chunks.push((0, text.len()));
+        }
+
+        // A sentence can itself exceed the model limit. Split those chunks on
+        // tokenizer boundaries before inference, retaining a small token
+        // overlap so a boundary entity appears in a complete window.
+        let mut model_sized_chunks = Vec::new();
+        for (byte_start, byte_end) in chunks {
+            model_sized_chunks.extend(self.split_oversized_chunk(text, byte_start, byte_end)?);
+        }
+
+        // Run each chunk and collect entities with global char offsets.
+        let mut all_entities = Vec::new();
+        for (byte_start, byte_end) in &model_sized_chunks {
+            let chunk = &text[*byte_start..*byte_end];
+            let encoding = self.encode_untruncated(chunk)?;
+            let mut chunk_entities = self.extract_entities_single(chunk, &encoding)?;
+            // Shift character offsets to global positions
+            if *byte_start > 0 {
+                let char_offset = text[..*byte_start].chars().count();
+                for e in &mut chunk_entities {
+                    e.shift_by(char_offset); // atomic; avoids transient span inversion
+                }
+            }
+            all_entities.extend(chunk_entities);
+        }
+
+        // Deduplicate entities from overlapping regions, retaining the highest
+        // confidence version when (start, end, type) collide.
+        Self::deduplicate_chunk_entities(&mut all_entities);
+        // Also remove entities fully contained within a larger entity (from overlap)
+        let mut keep = vec![true; all_entities.len()];
+        for i in 0..all_entities.len() {
+            for j in 0..all_entities.len() {
+                if i != j
+                    && keep[j]
+                    && all_entities[i].start() >= all_entities[j].start()
+                    && all_entities[i].end() <= all_entities[j].end()
+                    && (all_entities[i].start() != all_entities[j].start()
+                        || all_entities[i].end() != all_entities[j].end())
+                {
+                    keep[i] = false;
+                    break;
+                }
+            }
+        }
+        let all_entities: Vec<Entity> = all_entities
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| keep[*i])
+            .map(|(_, e)| e)
+            .collect();
+
+        Ok(all_entities)
+    }
+
+    /// Split one already-selected text range into model-sized tokenizer windows.
+    ///
+    /// Sentence boundaries are preferred by [`Self::extract_entities_chunked`].
+    /// This fallback only handles a single sentence that exceeds the model
+    /// window, and always advances on a tokenizer byte boundary.
+    fn split_oversized_chunk(
+        &self,
+        text: &str,
+        byte_start: usize,
+        byte_end: usize,
+    ) -> Result<Vec<(usize, usize)>> {
+        let mut chunks = Vec::new();
+        let mut cursor = byte_start;
+        while cursor < byte_end {
+            let encoding = self.encode_untruncated(&text[cursor..byte_end])?;
+            if encoding.len() <= Self::MAX_TOKENS + 2 {
+                chunks.push((cursor, byte_end));
+                break;
+            }
+
+            let content_offsets: Vec<_> = encoding
+                .get_offsets()
+                .iter()
+                .copied()
+                .filter(|(start, end)| start < end)
+                .collect();
+            if content_offsets.len() <= Self::MAX_TOKENS {
+                return Err(Error::Parse(format!(
+                    "BERT tokenizer produced {} content tokens for an over-limit encoding",
+                    content_offsets.len()
+                )));
+            }
+            let window_end = cursor + content_offsets[Self::MAX_TOKENS - 1].1;
+            let overlap_start =
+                cursor + content_offsets[Self::MAX_TOKENS - Self::HARD_CHUNK_OVERLAP_TOKENS].0;
+            if window_end <= cursor || overlap_start <= cursor {
+                return Err(Error::Parse(
+                    "BERT tokenizer produced a non-advancing oversized chunk boundary".into(),
+                ));
+            }
+            chunks.push((cursor, window_end));
+            cursor = overlap_start;
+        }
+        Ok(chunks)
+    }
+
+    fn deduplicate_chunk_entities(entities: &mut Vec<Entity>) {
+        entities.sort_by(|a, b| {
+            a.start()
+                .cmp(&b.start())
+                .then(a.end().cmp(&b.end()))
+                .then(a.entity_type.to_string().cmp(&b.entity_type.to_string()))
+                .then_with(|| b.confidence.value().total_cmp(&a.confidence.value()))
+                .then_with(|| a.text.cmp(&b.text))
+        });
+        entities.dedup_by(|b, a| {
+            a.start() == b.start() && a.end() == b.end() && a.entity_type == b.entity_type
+        });
+    }
+
+    fn extract_entities_single(
+        &self,
+        text: &str,
+        encoding: &tokenizers::Encoding,
+    ) -> Result<Vec<Entity>> {
+        self.with_logits(encoding, |logits, _has_token_type_ids| {
+            self.decode_output(logits, text, encoding)
+        })
+    }
+
+    /// Invoke the selected graph once and expose its `logits` tensor to a
+    /// caller while the ONNX session output remains valid.
+    fn with_logits<T>(
+        &self,
+        encoding: &tokenizers::Encoding,
+        consume: impl FnOnce(&ort::value::DynValue, bool) -> Result<T>,
+    ) -> Result<T> {
+        let input_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
+        let attention_mask: Vec<i64> = encoding
+            .get_attention_mask()
+            .iter()
+            .map(|&mask| mask as i64)
+            .collect();
+        let batch_size = 1;
+        let seq_len = input_ids.len();
+
+        // Create input tensors
+        let input_ids_array: Array2<i64> =
+            Array2::from_shape_vec((batch_size, seq_len), input_ids.clone())
+                .map_err(|e| Error::Parse(format!("Failed to create input_ids array: {}", e)))?;
+
+        let attention_mask_array: Array2<i64> =
+            Array2::from_shape_vec((batch_size, seq_len), attention_mask.clone()).map_err(|e| {
+                Error::Parse(format!("Failed to create attention_mask array: {}", e))
+            })?;
+
+        let input_ids_tensor = super::ort_compat::tensor_from_ndarray(input_ids_array)
+            .map_err(|e| Error::Parse(format!("Failed to create input_ids tensor: {}", e)))?;
+
+        let attention_mask_tensor = super::ort_compat::tensor_from_ndarray(attention_mask_array)
+            .map_err(|e| Error::Parse(format!("Failed to create attention_mask tensor: {}", e)))?;
+
+        // Run inference with blocking lock for thread-safe parallel access
+        let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Check if the model expects token_type_ids (BERT does, DeBERTa-v3 does not).
+        let has_token_type_ids = session
+            .inputs()
+            .iter()
+            .any(|input| input.name() == "token_type_ids");
+
+        let outputs = if has_token_type_ids {
+            let token_type_ids: Vec<i64> = vec![0i64; seq_len];
+            let token_type_ids_array: Array2<i64> =
+                Array2::from_shape_vec((batch_size, seq_len), token_type_ids).map_err(|e| {
+                    Error::Parse(format!("Failed to create token_type_ids array: {}", e))
+                })?;
+            let token_type_ids_tensor =
+                super::ort_compat::tensor_from_ndarray(token_type_ids_array).map_err(|e| {
+                    Error::Parse(format!("Failed to create token_type_ids tensor: {}", e))
+                })?;
+            session.run(ort::inputs![
+                "input_ids" => input_ids_tensor.into_dyn(),
+                "attention_mask" => attention_mask_tensor.into_dyn(),
+                "token_type_ids" => token_type_ids_tensor.into_dyn(),
+            ])
+        } else {
+            session.run(ort::inputs![
+                "input_ids" => input_ids_tensor.into_dyn(),
+                "attention_mask" => attention_mask_tensor.into_dyn(),
+            ])
+        }
+        .map_err(|e| Error::Parse(format!("ONNX inference failed: {}", e)))?;
+
+        // Get logits output - BERT NER models have "logits" as output
+        let logits = outputs.get("logits").ok_or_else(|| {
+            Error::Parse("ONNX model output does not contain 'logits' key".to_string())
+        })?;
+
+        consume(logits, has_token_type_ids)
+    }
+
+    /// Run exactly one BERT window and return the inputs, logits, labels, and
+    /// decoded output used by anno. This is intended for implementation-parity
+    /// tests with another host of the *same selected local graph*.
+    pub fn debug_trace(&self, text: &str) -> Result<BertNerTrace> {
+        let encoding = self.encode_untruncated(text)?;
+        if encoding.len() > Self::MAX_TOKENS + 2 {
+            return Err(Error::Parse(format!(
+                "BERT parity trace accepts one window (at most {} tokens including special tokens), got {}",
+                Self::MAX_TOKENS + 2,
+                encoding.len()
+            )));
+        }
+        let artifacts = self.trace_artifacts()?;
+
+        self.with_logits(&encoding, |output, has_token_type_ids| {
+            let (shape, logits_data) = output
+                .try_extract_tensor::<f32>()
+                .map_err(|e| Error::Parse(format!("Failed to extract logits tensor: {e}")))?;
+            if shape.len() != 3 || shape[0] != 1 {
+                return Err(Error::Parse(format!("Unexpected logits shape: {shape:?}")));
+            }
+            let sequence_len = shape[1] as usize;
+            let label_count = shape[2] as usize;
+            let expected_len = sequence_len.checked_mul(label_count).ok_or_else(|| {
+                Error::Parse("BERT parity trace logits size overflow".to_string())
+            })?;
+            if logits_data.len() != expected_len {
+                return Err(Error::Parse(format!(
+                    "BERT parity trace logits length {} does not match shape {shape:?}",
+                    logits_data.len()
+                )));
+            }
+
+            let logits: Vec<Vec<f32>> = logits_data
+                .chunks_exact(label_count)
+                .map(|row| row.to_vec())
+                .collect();
+            let labels = logits
+                .iter()
+                .map(|row| {
+                    let label_id = row
+                        .iter()
+                        .enumerate()
+                        .max_by(|(_, left), (_, right)| left.total_cmp(right))
+                        .map(|(id, _)| id)
+                        .unwrap_or(0);
+                    self.id_to_label
+                        .get(&label_id)
+                        .cloned()
+                        .unwrap_or_else(|| format!("LABEL_{label_id}"))
+                })
+                .collect();
+            let entities = self.decode_output(output, text, &encoding)?;
+
+            Ok(BertNerTrace {
+                artifacts,
+                input_ids: encoding.get_ids().to_vec(),
+                attention_mask: encoding.get_attention_mask().to_vec(),
+                token_type_ids: has_token_type_ids.then(|| vec![0; encoding.len()]),
+                tokens: encoding.get_tokens().to_vec(),
+                offsets: encoding.get_offsets().to_vec(),
+                word_ids: encoding.get_word_ids().to_vec(),
+                logits,
+                labels,
+                entities: entities
+                    .into_iter()
+                    .map(|entity| {
+                        let start = entity.start();
+                        let end = entity.end();
+                        let entity_type = entity.entity_type.to_string();
+                        let confidence = entity.confidence.value();
+                        BertNerTraceEntity {
+                            text: entity.text,
+                            start,
+                            end,
+                            entity_type,
+                            confidence,
+                        }
+                    })
+                    .collect(),
+            })
+        })
+    }
+
+    /// Decode model output logits to NER entities.
+    fn decode_output(
+        &self,
+        output: &ort::value::DynValue,
+        text: &str,
+        encoding: &tokenizers::Encoding,
+    ) -> Result<Vec<Entity>> {
+        // Extract logits as f32 array - ort returns (Shape, &[f32])
+        let (shape, logits_data) = output
+            .try_extract_tensor::<f32>()
+            .map_err(|e| Error::Parse(format!("Failed to extract logits tensor: {}", e)))?;
+
+        // Expected shape: [batch_size, seq_len, num_labels]
+        if shape.len() != 3 || shape[0] != 1 {
+            return Err(Error::Parse(format!(
+                "Unexpected logits shape: {:?}",
+                shape
+            )));
+        }
+
+        let seq_len = shape[1] as usize;
+        let num_labels = shape[2] as usize;
+
+        // Get token offsets for mapping back to character positions
+        let offsets = encoding.get_offsets();
+
+        // Use word_ids for robust subword continuation detection.
+        // Tokens belonging to the same word share a word_id; this is far more
+        // reliable than checking byte_start == prev_end for subword grouping.
+        let word_ids = encoding.get_word_ids();
+
+        // `tokenizers::Encoding::get_offsets()` uses byte offsets in Rust. `Entity` uses character
+        // offsets, so convert via SpanConverter when constructing entities.
+        let span_converter = crate::offset::SpanConverter::new(text);
+
+        // Helper to access logits[0, token_idx, label_idx] in flattened array
+        let get_logit = |token_idx: usize, label_idx: usize| -> f32 {
+            logits_data[token_idx * num_labels + label_idx]
+        };
+
+        // Helper: finalize an entity from byte offsets, trimming whitespace and
+        // adjusting character offsets to match the trimmed text.
+        let finalize_entity = |start: usize,
+                               end: usize,
+                               entity_type: EntityType,
+                               conf: f64,
+                               entities: &mut Vec<Entity>| {
+            if start >= end || end > text.len() {
+                return;
+            }
+            if let Some(slice) = text.get(start..end) {
+                let trimmed = slice.trim();
+                if trimmed.is_empty() {
+                    return;
+                }
+                // Adjust byte offsets to account for trimmed whitespace.
+                let leading = slice.len() - slice.trim_start().len();
+                let trailing = slice.len() - slice.trim_end().len();
+                let mut adj_start = start + leading;
+                let mut adj_end = end - trailing;
+
+                // Heal word-boundary misalignment from BPE subword
+                // mislabeling: extend to the enclosing word boundary when the
+                // entity starts or ends mid-word.
+                while adj_start > 0
+                    && text
+                        .get(adj_start.saturating_sub(1)..adj_start)
+                        .and_then(|s| s.chars().next())
+                        .is_some_and(|c| c.is_alphanumeric())
+                {
+                    adj_start -= text[..adj_start]
+                        .chars()
+                        .next_back()
+                        .map_or(1, |c| c.len_utf8());
+                }
+                while adj_end < text.len()
+                    && text
+                        .get(adj_end..adj_end + 1)
+                        .and_then(|s| s.chars().next())
+                        .is_some_and(|c| c.is_alphanumeric())
+                {
+                    adj_end += text[adj_end..].chars().next().map_or(1, |c| c.len_utf8());
+                }
+                let healed = text.get(adj_start..adj_end).unwrap_or(trimmed).trim();
+                if healed.is_empty() {
+                    return;
+                }
+                entities.push(Entity::new(
+                    healed.to_string(),
+                    entity_type,
+                    span_converter.byte_to_char(adj_start),
+                    span_converter.byte_to_char_ceil(adj_end),
+                    conf,
+                ));
+            }
+        };
+
+        // Track the word_id of the last token added to the current entity,
+        // so we can detect subword continuation even when labels disagree.
+        let mut last_entity_word_id: Option<u32> = None;
+
+        // Performance: Pre-allocate entities vec with estimated capacity
+        // Most texts have 0-20 entities, but we'll start with a reasonable default
+        let mut entities = Vec::with_capacity(16);
+        let mut current_entity: Option<(usize, usize, EntityType, f64)> = None; // (start_byte, end_byte, type, confidence)
+
+        for token_idx in 0..seq_len {
+            // Skip special tokens (no offset)
+            if token_idx >= offsets.len() {
+                continue;
+            }
+            let (byte_start, byte_end) = offsets[token_idx];
+            let cur_word_id = word_ids.get(token_idx).copied().flatten();
+            if byte_start == byte_end {
+                // Special token, finalize current entity
+                if let Some((start, end, entity_type, conf)) = current_entity.take() {
+                    finalize_entity(start, end, entity_type, conf, &mut entities);
+                    last_entity_word_id = None;
+                }
+                continue;
+            }
+
+            // Get logits for this token and find argmax
+            let mut max_idx = 0;
+            let mut max_val = f32::NEG_INFINITY;
+            for label_idx in 0..num_labels {
+                let val = get_logit(token_idx, label_idx);
+                if val > max_val {
+                    max_val = val;
+                    max_idx = label_idx;
+                }
+            }
+
+            // Convert to probability using softmax
+            let exp_sum: f32 = (0..num_labels)
+                .map(|i| (get_logit(token_idx, i) - max_val).exp())
+                .sum();
+            // Handle division by zero: if exp_sum == 0.0 or num_labels == 0, use fallback
+            let confidence = if exp_sum > 0.0 && num_labels > 0 {
+                (1.0_f32 / exp_sum) as f64 // exp(0) / exp_sum = 1/exp_sum
+            } else {
+                0.0 // Fallback for edge cases
+            };
+
+            let label = self
+                .id_to_label
+                .get(&max_idx)
+                .cloned()
+                .unwrap_or_else(|| format!("LABEL_{}", max_idx));
+
+            // Detect subword continuation: either same word_id as the previous
+            // entity token, or byte-adjacent and starting with alphanumeric.
+            let starts_alnum = text
+                .get(byte_start..)
+                .and_then(|s| s.chars().next())
+                .is_some_and(|c| c.is_alphanumeric());
+            let same_word =
+                starts_alnum && cur_word_id.is_some() && cur_word_id == last_entity_word_id;
+            let byte_adjacent = starts_alnum
+                && current_entity
+                    .as_ref()
+                    .map(|(_, prev_end, _, _)| byte_start == *prev_end)
+                    .unwrap_or(false);
+            let is_subword_continuation = current_entity.is_some() && (same_word || byte_adjacent);
+
+            // Skip "O" (outside) labels -- but if this token is a subword
+            // continuation (same word_id OR no whitespace gap AND starts with
+            // an alphanumeric character), extend the current entity span rather
+            // than closing it.  This is the "first-token aggregation" strategy:
+            // the label of the first subword token determines the entity
+            // boundary, and subsequent subwords always extend it.  We require
+            // alphanumeric to avoid absorbing trailing punctuation (e.g.
+            // "Strasbourg.").
+            if label == "O" {
+                if is_subword_continuation {
+                    // Extend: keep the entity open with the new byte_end.
+                    if let Some((start, _, etype, conf)) = current_entity.take() {
+                        current_entity = Some((start, byte_end, etype, conf));
+                        last_entity_word_id = cur_word_id;
+                    }
+                } else if current_entity
+                    .as_ref()
+                    .is_some_and(|(_, prev_end, prev_type, _)| {
+                        // Name completion: BERT often tags surnames as O when
+                        // they follow a recognized given name.  Absorb adjacent
+                        // capitalized words (proper-noun pattern: Uppercase
+                        // followed by lowercase) into PER entities.
+                        //
+                        // Also absorb across hyphens (e.g. "Jean-Claude") where
+                        // the gap is exactly a '-' character.
+                        matches!(prev_type, EntityType::Person)
+                            && byte_start <= *prev_end + 2
+                            && {
+                                let gap_is_connector = byte_start == *prev_end + 1
+                                    || text
+                                        .get(*prev_end..byte_start)
+                                        .is_some_and(|g| g == " " || g == "-");
+                                gap_is_connector
+                            }
+                            && text
+                                .get(byte_start..)
+                                .map(|s| {
+                                    let mut chars = s.chars();
+                                    match (chars.next(), chars.next()) {
+                                        (Some(c1), Some(c2)) => {
+                                            c1.is_uppercase() && c2.is_lowercase()
+                                        }
+                                        _ => false,
+                                    }
+                                })
+                                .unwrap_or(false)
+                    })
+                {
+                    if let Some((start, _, etype, conf)) = current_entity.take() {
+                        current_entity = Some((start, byte_end, etype, conf));
+                        last_entity_word_id = cur_word_id;
+                    }
+                } else if current_entity
+                    .as_ref()
+                    .is_some_and(|(_, prev_end, prev_type, _)| {
+                        // Keep PER entity open across a hyphen token so the
+                        // next B-PER token can merge (e.g. "Jean-Claude").
+                        matches!(prev_type, EntityType::Person)
+                            && byte_start == *prev_end
+                            && text.get(byte_start..byte_end).is_some_and(|t| t == "-")
+                    })
+                {
+                    // Don't finalize -- leave current_entity as-is,
+                    // the next token's B-tag merge will pick it up.
+                } else if let Some((start, end, entity_type, conf)) = current_entity.take() {
+                    finalize_entity(start, end, entity_type, conf, &mut entities);
+                    last_entity_word_id = None;
+                }
+                continue;
+            }
+
+            // Parse BIO tag
+            let (bio, entity_label) = if label.starts_with("B-") {
+                ("B", label[2..].to_string())
+            } else if label.starts_with("I-") {
+                ("I", label[2..].to_string())
+            } else {
+                ("B", label.clone())
+            };
+
+            let entity_type = self
+                .label_to_entity_type
+                .get(&format!("B-{}", entity_label))
+                .or_else(|| self.label_to_entity_type.get(&entity_label))
+                .cloned()
+                .unwrap_or_else(|| EntityType::custom(entity_label.clone(), EntityCategory::Misc));
+
+            match bio {
+                "B" => {
+                    // A B tag starts a new BIO entity. The sole exception is
+                    // a second token for the same lexical word, which keeps
+                    // the decoder's first-subword aggregation behavior.
+                    let should_merge = continues_bio_entity(
+                        bio,
+                        is_subword_continuation,
+                        current_entity
+                            .as_ref()
+                            .map(|(_, _, entity_type, _)| entity_type),
+                        &entity_type,
+                    );
+
+                    if should_merge {
+                        // Extend the current entity instead of starting new
+                        if let Some((start, _, prev_type, conf)) = current_entity.take() {
+                            current_entity = Some((start, byte_end, prev_type, conf));
+                            last_entity_word_id = cur_word_id;
+                        }
+                    } else {
+                        // Finalize previous entity and start new
+                        if let Some((start, end, prev_type, conf)) = current_entity.take() {
+                            finalize_entity(start, end, prev_type, conf, &mut entities);
+                        }
+                        // Start new entity
+                        current_entity = Some((byte_start, byte_end, entity_type, confidence));
+                        last_entity_word_id = cur_word_id;
+                    }
+                }
+                "I" => {
+                    // Continue current entity if same type
+                    if let Some((start, _end, ref prev_type, conf)) = current_entity {
+                        if continues_bio_entity("I", false, Some(prev_type), &entity_type) {
+                            current_entity = Some((start, byte_end, entity_type, conf));
+                            last_entity_word_id = cur_word_id;
+                        } else {
+                            // Different type - finalize and start new
+                            let prev_type = prev_type.clone();
+                            let (start, end) = (start, _end);
+                            current_entity.take();
+                            finalize_entity(start, end, prev_type, conf, &mut entities);
+                            current_entity = Some((byte_start, byte_end, entity_type, confidence));
+                            last_entity_word_id = cur_word_id;
+                        }
+                    } else {
+                        // No current entity, treat I- as B-
+                        current_entity = Some((byte_start, byte_end, entity_type, confidence));
+                        last_entity_word_id = cur_word_id;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Finalize last entity
+        if let Some((start, end, entity_type, conf)) = current_entity {
+            finalize_entity(start, end, entity_type, conf, &mut entities);
+        }
+
+        Ok(entities)
+    }
+
+    /// Get the model name.
+    pub fn model_name(&self) -> &str {
+        &self.model_name
+    }
+}
+
+#[cfg(feature = "onnx")]
+impl crate::Model for BertNEROnnx {
+    fn extract_entities(&self, text: &str, language: Option<Language>) -> Result<Vec<Entity>> {
+        self.extract_entities(text, language)
+    }
+
+    fn supported_types(&self) -> Vec<EntityType> {
+        vec![
+            EntityType::Person,
+            EntityType::Organization,
+            EntityType::Location,
+            EntityType::custom("MISC", EntityCategory::Misc),
+        ]
+    }
+
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "bert-onnx"
+    }
+
+    fn description(&self) -> &'static str {
+        "BERT-based NER using ONNX Runtime (PER/ORG/LOC/MISC)"
+    }
+
+    fn version(&self) -> String {
+        format!(
+            "bert-onnx-{}-{}",
+            self.model_name,
+            if self.is_quantized { "q" } else { "fp32" }
+        )
+    }
+
+    fn capabilities(&self) -> crate::ModelCapabilities {
+        crate::ModelCapabilities::default()
+    }
+}
+
+// Stub implementation when feature is disabled
+crate::backends::macros::define_feature_stub! {
+    struct BertNEROnnx;
+    feature = "onnx";
+    name = "bert-onnx (unavailable)";
+    description = "BERT-based NER using ONNX Runtime - requires 'onnx' feature";
+    error_msg = "BERT NER ONNX requires the 'onnx' feature";
+    methods {
+        pub fn model_name(&self) -> &str {
+            "onnx-not-enabled"
+        }
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "onnx")]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_local_rejects_nonexistent_dir() {
+        let result = BertNEROnnx::new("/nonexistent/path/to/model");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn from_local_rejects_dir_without_model_onnx() {
+        let dir = std::env::temp_dir().join("anno_test_bert_no_model");
+        let _ = std::fs::create_dir_all(&dir);
+        let result = BertNEROnnx::new(dir.to_str().unwrap());
+        match result {
+            Ok(_) => panic!("expected error for empty dir"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("model.onnx not found"),
+                    "expected 'model.onnx not found', got: {msg}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_local_rejects_dir_without_tokenizer() {
+        let dir = std::env::temp_dir().join("anno_test_bert_no_tok");
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("model.onnx"), b"not a real model").unwrap();
+        let result = BertNEROnnx::new(dir.to_str().unwrap());
+        match result {
+            Ok(_) => panic!("expected error for dir without tokenizer"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("tokenizer.json not found"),
+                    "expected 'tokenizer.json not found', got: {msg}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression test: local directory paths are detected and loaded directly,
+    /// not treated as HuggingFace model IDs.
+    #[test]
+    fn local_dir_path_accepted_as_directory() {
+        let dir = std::env::temp_dir().join("anno_test_local_path");
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("model.onnx"), b"dummy").unwrap();
+        let result = BertNEROnnx::new(dir.to_str().unwrap());
+        match result {
+            Ok(_) => panic!("expected error for dummy model"),
+            Err(e) => {
+                let msg = e.to_string();
+                // Should fail at tokenizer loading, not at HF download
+                assert!(
+                    msg.contains("tokenizer.json"),
+                    "local dir should fail at tokenizer, not HF download. Got: {msg}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_id_to_label_parses_conll03() {
+        let config: serde_json::Value = serde_json::from_str(
+            r#"{"id2label": {"0": "O", "1": "B-PER", "2": "I-PER", "3": "B-ORG", "4": "I-ORG"}}"#,
+        )
+        .unwrap();
+        let map = BertNEROnnx::build_id_to_label(&config);
+        assert_eq!(map.get(&1), Some(&"B-PER".to_string()));
+        assert_eq!(map.get(&3), Some(&"B-ORG".to_string()));
+    }
+
+    #[test]
+    fn build_id_to_label_fallback_when_missing() {
+        let config: serde_json::Value = serde_json::from_str(r#"{}"#).unwrap();
+        let map = BertNEROnnx::build_id_to_label(&config);
+        // Should produce CoNLL-03 fallback
+        assert!(map.contains_key(&0), "fallback should have key 0 (O label)");
+        assert!(
+            map.contains_key(&3),
+            "fallback should have key 3 (B-PER label)"
+        );
+    }
+
+    #[test]
+    fn build_id_to_label_conll03_fallback_complete() {
+        let config: serde_json::Value = serde_json::from_str(r#"{}"#).unwrap();
+        let map = BertNEROnnx::build_id_to_label(&config);
+        assert_eq!(map.len(), 9);
+        assert_eq!(map[&0], "O");
+        assert_eq!(map[&1], "B-MISC");
+        assert_eq!(map[&2], "I-MISC");
+        assert_eq!(map[&3], "B-PER");
+        assert_eq!(map[&4], "I-PER");
+        assert_eq!(map[&5], "B-ORG");
+        assert_eq!(map[&6], "I-ORG");
+        assert_eq!(map[&7], "B-LOC");
+        assert_eq!(map[&8], "I-LOC");
+    }
+
+    #[test]
+    fn build_id_to_label_custom_format() {
+        let config: serde_json::Value = serde_json::from_str(
+            r#"{"id2label": {"0": "O", "1": "B-DISEASE", "2": "I-DISEASE", "3": "B-DRUG", "4": "I-DRUG"}}"#,
+        )
+        .unwrap();
+        let map = BertNEROnnx::build_id_to_label(&config);
+        assert_eq!(map.len(), 5);
+        assert_eq!(map[&1], "B-DISEASE");
+        assert_eq!(map[&3], "B-DRUG");
+    }
+
+    #[test]
+    fn build_label_to_entity_type_standard() {
+        let map = BertNEROnnx::build_label_to_entity_type();
+        assert_eq!(map["B-PER"], EntityType::Person);
+        assert_eq!(map["I-PER"], EntityType::Person);
+        assert_eq!(map["B-ORG"], EntityType::Organization);
+        assert_eq!(map["I-ORG"], EntityType::Organization);
+        assert_eq!(map["B-LOC"], EntityType::Location);
+        assert_eq!(map["I-LOC"], EntityType::Location);
+        // Alternative format
+        assert_eq!(map["PER"], EntityType::Person);
+        assert_eq!(map["ORG"], EntityType::Organization);
+        assert_eq!(map["LOC"], EntityType::Location);
+    }
+
+    #[test]
+    fn build_label_to_entity_type_bio_consistency() {
+        let map = BertNEROnnx::build_label_to_entity_type();
+        // B- and I- tags for the same entity should map to the same type
+        assert_eq!(map["B-PER"], map["I-PER"]);
+        assert_eq!(map["B-ORG"], map["I-ORG"]);
+        assert_eq!(map["B-LOC"], map["I-LOC"]);
+        assert_eq!(map["B-MISC"], map["I-MISC"]);
+    }
+
+    #[test]
+    fn config_defaults() {
+        let config = BertNERConfig::default();
+        // Verify defaults are sensible (not checking specific values -- they may change)
+        assert!(config.num_threads > 0, "num_threads should be positive");
+    }
+
+    #[test]
+    fn chunk_dedup_retains_highest_confidence_duplicate() {
+        let mut entities = vec![
+            Entity::new("Paris", EntityType::Location, 0, 5, 0.72),
+            Entity::new("Paris", EntityType::Location, 0, 5, 0.94),
+        ];
+
+        BertNEROnnx::deduplicate_chunk_entities(&mut entities);
+
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].confidence.value(), 0.94);
+    }
+
+    /// Requires the `protectai/bert-base-NER-onnx` model and tokenizer to
+    /// already be cached. Run with `ANNO_NO_DOWNLOADS=1` so the test cannot
+    /// fetch them.
+    #[test]
+    #[ignore = "requires cached protectai/bert-base-NER-onnx; run with ANNO_NO_DOWNLOADS=1"]
+    fn decode_output_keeps_adjacent_begin_location_tags_separate(
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        assert_eq!(
+            std::env::var("ANNO_NO_DOWNLOADS").as_deref(),
+            Ok("1"),
+            "this regression must run cache-only; set ANNO_NO_DOWNLOADS=1"
+        );
+
+        let mut model = BertNEROnnx::new("protectai/bert-base-NER-onnx")?;
+        let artifacts = model.artifact_paths();
+        assert!(
+            artifacts.graph.is_file(),
+            "graph: {}",
+            artifacts.graph.display()
+        );
+        assert!(
+            artifacts.tokenizer.is_file(),
+            "tokenizer: {}",
+            artifacts.tokenizer.display()
+        );
+        assert!(
+            artifacts
+                .config
+                .as_deref()
+                .is_some_and(std::path::Path::is_file),
+            "config: {:?}",
+            artifacts.config
+        );
+        assert_eq!(
+            artifacts.graph.file_name().and_then(|name| name.to_str()),
+            Some("model.onnx"),
+            "the cached revision has no quantized graph, so provenance must report fp32"
+        );
+        let text = "Paris London";
+        let label_count = model.id_to_label.keys().max().copied().unwrap_or(0) + 1;
+        let trace = model.debug_trace(text)?;
+        assert_eq!(trace.artifacts.graph.sha256.len(), 64);
+        assert_eq!(trace.artifacts.tokenizer.sha256.len(), 64);
+        assert_eq!(
+            trace
+                .artifacts
+                .config
+                .as_ref()
+                .map(|config| config.sha256.len()),
+            Some(64)
+        );
+        assert_eq!(trace.input_ids.len(), trace.tokens.len());
+        assert_eq!(trace.input_ids.len(), trace.attention_mask.len());
+        assert_eq!(trace.input_ids.len(), trace.offsets.len());
+        assert_eq!(trace.input_ids.len(), trace.word_ids.len());
+        assert_eq!(trace.input_ids.len(), trace.logits.len());
+        assert_eq!(trace.input_ids.len(), trace.labels.len());
+        assert_eq!(trace.token_type_ids, Some(vec![0; trace.input_ids.len()]));
+        assert!(trace.logits.iter().all(|row| row.len() == label_count));
+        if std::env::var_os("ANNO_BERT_TRACE_JSON").is_some() {
+            println!(
+                "ANNO_BERT_TRACE_JSON={}",
+                serde_json::to_string(&trace).expect("BERT trace must serialize")
+            );
+        }
+        let encoding = model.tokenizer().encode(text, true)?;
+        let outside_label = model
+            .id_to_label
+            .iter()
+            .find_map(|(&id, label)| (label == "O").then_some(id))
+            .expect("cached model must define O");
+        let location_label = model
+            .id_to_label
+            .iter()
+            .find_map(|(&id, label)| (label == "B-LOC").then_some(id))
+            .expect("cached model must define B-LOC");
+
+        let mut logits =
+            ndarray::Array3::from_elem((1, encoding.len(), label_count), f32::NEG_INFINITY);
+        for token_idx in 0..encoding.len() {
+            logits[[0, token_idx, outside_label]] = 0.0;
+        }
+        for (token_idx, offset) in encoding.get_offsets().iter().enumerate() {
+            if matches!(*offset, (0, 5) | (6, 12)) {
+                logits[[0, token_idx, location_label]] = 1.0;
+            }
+        }
+
+        let output: ort::value::DynValue = ort::value::Tensor::<f32>::from_array((
+            logits.shape().to_vec(),
+            logits.into_raw_vec_and_offset().0,
+        ))?
+        .into();
+        let entities = model.decode_output(&output, text, &encoding)?;
+
+        assert_eq!(entities.len(), 2, "{entities:#?}");
+        assert_eq!(entities[0].text, "Paris");
+        assert_eq!(entities[0].entity_type, EntityType::Location);
+        assert_eq!(entities[0].start(), 0);
+        assert_eq!(entities[0].end(), 5);
+        assert_eq!(entities[1].text, "London");
+        assert_eq!(entities[1].entity_type, EntityType::Location);
+        assert_eq!(entities[1].start(), 6);
+        assert_eq!(entities[1].end(), 12);
+
+        // The production decoder deliberately extends a PER entity over an
+        // adjacent capitalized O-tagged surname. Keep that policy explicit:
+        // it is postprocessing, not a graph/tokenizer parity discrepancy.
+        let person_label = model
+            .id_to_label
+            .iter()
+            .find_map(|(&id, label)| (label == "B-PER").then_some(id))
+            .expect("cached model must define B-PER");
+        let name_text = "Marie Curie";
+        let name_encoding = model.tokenizer().encode(name_text, true)?;
+        let mut name_logits =
+            ndarray::Array3::from_elem((1, name_encoding.len(), label_count), f32::NEG_INFINITY);
+        for token_idx in 0..name_encoding.len() {
+            name_logits[[0, token_idx, outside_label]] = 0.0;
+        }
+        for (token_idx, offset) in name_encoding.get_offsets().iter().enumerate() {
+            if *offset == (0, 5) {
+                name_logits[[0, token_idx, person_label]] = 1.0;
+            }
+        }
+        let name_output: ort::value::DynValue = ort::value::Tensor::<f32>::from_array((
+            name_logits.shape().to_vec(),
+            name_logits.into_raw_vec_and_offset().0,
+        ))?
+        .into();
+        let name_entities = model.decode_output(&name_output, name_text, &name_encoding)?;
+        assert_eq!(name_entities.len(), 1, "{name_entities:#?}");
+        assert_eq!(name_entities[0].text, "Marie Curie");
+        assert_eq!(name_entities[0].entity_type, EntityType::Person);
+        assert_eq!((name_entities[0].start(), name_entities[0].end()), (0, 11));
+
+        // Reuse two non-O slots to exercise the `Custom` equality branch
+        // through the production decoder. A discriminant-only comparison
+        // would merge these distinct labels into one entity.
+        let mut custom_ids: Vec<_> = model
+            .id_to_label
+            .keys()
+            .copied()
+            .filter(|id| *id != outside_label)
+            .collect();
+        custom_ids.sort_unstable();
+        let disease_label = custom_ids[0];
+        let drug_label = custom_ids[1];
+        model
+            .id_to_label
+            .insert(disease_label, "B-DISEASE".to_string());
+        model.id_to_label.insert(drug_label, "I-DRUG".to_string());
+
+        let mut custom_logits =
+            ndarray::Array3::from_elem((1, encoding.len(), label_count), f32::NEG_INFINITY);
+        for token_idx in 0..encoding.len() {
+            custom_logits[[0, token_idx, outside_label]] = 0.0;
+        }
+        for (token_idx, offset) in encoding.get_offsets().iter().enumerate() {
+            match *offset {
+                (0, 5) => custom_logits[[0, token_idx, disease_label]] = 1.0,
+                (6, 12) => custom_logits[[0, token_idx, drug_label]] = 1.0,
+                _ => {}
+            }
+        }
+
+        let custom_output: ort::value::DynValue = ort::value::Tensor::<f32>::from_array((
+            custom_logits.shape().to_vec(),
+            custom_logits.into_raw_vec_and_offset().0,
+        ))?
+        .into();
+        let custom_entities = model.decode_output(&custom_output, text, &encoding)?;
+        assert_eq!(custom_entities.len(), 2, "{custom_entities:#?}");
+        assert_eq!(
+            custom_entities[0].entity_type,
+            EntityType::custom("DISEASE", EntityCategory::Misc)
+        );
+        assert_eq!(
+            custom_entities[1].entity_type,
+            EntityType::custom("DRUG", EntityCategory::Misc)
+        );
+
+        Ok(())
+    }
+
+    /// Run a fixed panel through the selected cached graph. The JSON trace is
+    /// intentionally opt-in: the Python reference runner compares tokenizer
+    /// inputs and logits separately from the decoder's documented policies.
+    #[test]
+    #[ignore = "requires cached protectai/bert-base-NER-onnx; run with ANNO_NO_DOWNLOADS=1"]
+    fn debug_trace_covers_fixed_parity_panel(
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        assert_eq!(
+            std::env::var("ANNO_NO_DOWNLOADS").as_deref(),
+            Ok("1"),
+            "this regression must run cache-only; set ANNO_NO_DOWNLOADS=1"
+        );
+        let model = BertNEROnnx::new("protectai/bert-base-NER-onnx")?;
+        let cases = [
+            ("unicode_astral", "Beyoncé met Ada Lovelace in Montréal 🚀."),
+            (
+                "punctuation",
+                "Apple, Inc. hired Jane Doe; she visited New York.",
+            ),
+            (
+                "org_person_mix",
+                "Satya Nadella leads Microsoft Corporation.",
+            ),
+        ];
+
+        for (name, text) in cases {
+            let trace = model.debug_trace(text)?;
+            assert_eq!(trace.input_ids.len(), trace.tokens.len(), "{name}");
+            assert_eq!(trace.input_ids.len(), trace.attention_mask.len(), "{name}");
+            assert_eq!(trace.input_ids.len(), trace.offsets.len(), "{name}");
+            assert_eq!(trace.input_ids.len(), trace.word_ids.len(), "{name}");
+            assert_eq!(trace.input_ids.len(), trace.logits.len(), "{name}");
+            assert_eq!(trace.input_ids.len(), trace.labels.len(), "{name}");
+            assert!(
+                trace
+                    .entities
+                    .iter()
+                    .all(|entity| entity.start < entity.end && entity.end <= text.chars().count()),
+                "{name}: {:#?}",
+                trace.entities
+            );
+            if std::env::var_os("ANNO_BERT_PARITY_PANEL_JSON").is_some() {
+                println!(
+                    "ANNO_BERT_PARITY_PANEL_JSON={}",
+                    serde_json::json!({ "case": name, "text": text, "trace": trace })
+                );
+            }
+        }
+
+        // A trace represents one graph invocation; long-input extraction is
+        // covered separately by the tokenizer-truncation regression below.
+        assert!(model.debug_trace(&"Paris is sunny. ".repeat(200)).is_err());
+        assert!(model.debug_trace(&"Paris ".repeat(600)).is_err());
+
+        Ok(())
+    }
+
+    /// A tokenizer snapshot may serialize its own 512-token truncation rule.
+    /// BERT must disable that rule before probing and chunking, otherwise long
+    /// inputs appear short and lose their suffix without an error.
+    #[test]
+    #[ignore = "requires cached protectai/bert-base-NER-onnx; run with ANNO_NO_DOWNLOADS=1"]
+    fn long_inputs_are_chunked_without_tokenizer_truncation(
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        assert_eq!(
+            std::env::var("ANNO_NO_DOWNLOADS").as_deref(),
+            Ok("1"),
+            "this regression must run cache-only; set ANNO_NO_DOWNLOADS=1"
+        );
+        let model = BertNEROnnx::new("protectai/bert-base-NER-onnx")?;
+
+        for (text, terminal_suffix) in [
+            ("Paris is sunny. ".repeat(200), "Paris is sunny. "),
+            ("Paris ".repeat(600), "Paris "),
+        ] {
+            let terminal_start = text.chars().count() - terminal_suffix.chars().count();
+            let encoding = model.tokenizer().encode(text.as_str(), true)?;
+            assert!(
+                encoding.len() > BertNEROnnx::MAX_TOKENS + 2,
+                "the fixture must exceed BERT's graph window"
+            );
+            let entities = model.extract_entities(&text, None)?;
+            assert!(
+                entities
+                    .iter()
+                    .all(|entity| entity.start() < entity.end()
+                        && entity.end() <= text.chars().count()),
+                "{entities:#?}"
+            );
+            assert!(
+                entities.iter().any(|entity| {
+                    entity.start() <= terminal_start
+                        && entity.end() >= terminal_start + "Paris".chars().count()
+                }),
+                "chunked output must cover the terminal Paris rather than only a prefix location: {entities:#?}"
+            );
+        }
+
+        Ok(())
+    }
+}

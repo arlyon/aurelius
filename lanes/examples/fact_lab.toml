@@ -1,0 +1,29 @@
+[ontology]
+id = "lab_business"
+version = "1"
+
+[ontology.entities.person]
+description = "A person explicitly mentioned by the source."
+[ontology.entities.company]
+description = "A company explicitly mentioned by the source."
+[ontology.predicates.manages]
+description = "A person manages a company."
+subject_types = ["person"]
+object_types = ["company"]
+
+[language]
+model_dir = "./models/fcoref"
+max_document_tokens = 4096
+threads = 2
+
+[fact_quality]
+context_as_of = "2026-10-16T00:00:00Z"
+
+[chat]
+endpoint = "https://gateway.ai.cloudflare.com/v1/ACCOUNT/default/openai/responses"
+model = "gpt-6-luna"
+revision = "local-lab-v1"
+api = "responses"
+[chat.gateway]
+token_env = "CLOUDFLARE_AI_GATEWAY_TOKEN"
+byok_alias = "default"

@@ -1,0 +1,1145 @@
+use super::*;
+
+// =============================================================================
+// Candle Implementations
+// =============================================================================
+
+#[cfg(feature = "candle")]
+/// Candle-based encoder implementations.
+pub mod candle_impl {
+    use super::*;
+
+    /// Get the best available device.
+    pub fn best_device() -> Result<Device> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if let Ok(device) = Device::new_metal(0) {
+                log::info!("[Encoder] Using Metal GPU");
+                return Ok(device);
+            }
+        }
+
+        #[cfg(feature = "cuda")]
+        {
+            if let Ok(device) = Device::new_cuda(0) {
+                log::info!("[Encoder] Using CUDA GPU");
+                return Ok(device);
+            }
+        }
+
+        log::info!("[Encoder] Using CPU");
+        Ok(Device::Cpu)
+    }
+
+    // =========================================================================
+    // RoPE (Rotary Position Embeddings)
+    // =========================================================================
+
+    /// Compute rotary position embeddings.
+    ///
+    /// RoPE encodes position by rotating query/key vectors:
+    /// ```text
+    /// q' = q * cos(θ) + rotate_half(q) * sin(θ)
+    /// ```
+    ///
+    /// This allows extrapolation beyond training length.
+    pub struct RotaryEmbedding {
+        /// Cosine cache: [max_seq_len, head_dim/2]
+        cos_cache: Tensor,
+        /// Sine cache: [max_seq_len, head_dim/2]
+        sin_cache: Tensor,
+        /// Head dimension
+        _head_dim: usize,
+    }
+
+    impl RotaryEmbedding {
+        /// Create new rotary embeddings with precomputed sin/cos caches.
+        pub fn new(
+            head_dim: usize,
+            max_seq_len: usize,
+            theta: f64,
+            device: &Device,
+        ) -> Result<Self> {
+            // Compute inverse frequencies
+            let half_dim = head_dim / 2;
+            let inv_freq: Vec<f32> = (0..half_dim)
+                .map(|i| 1.0 / (theta.powf(i as f64 * 2.0 / head_dim as f64) as f32))
+                .collect();
+
+            // Position indices
+            let positions: Vec<f32> = (0..max_seq_len).map(|i| i as f32).collect();
+
+            // Compute angles: [max_seq_len, half_dim]
+            let inv_freq_t = Tensor::from_vec(inv_freq.clone(), (1, half_dim), device)
+                .map_err(|e| Error::Parse(format!("RoPE inv_freq: {}", e)))?;
+            let positions_t = Tensor::from_vec(positions.clone(), (max_seq_len, 1), device)
+                .map_err(|e| Error::Parse(format!("RoPE positions: {}", e)))?;
+
+            let angles = positions_t
+                .matmul(&inv_freq_t)
+                .map_err(|e| Error::Parse(format!("RoPE angles: {}", e)))?;
+
+            let cos_cache = angles
+                .cos()
+                .map_err(|e| Error::Parse(format!("RoPE cos: {}", e)))?;
+            let sin_cache = angles
+                .sin()
+                .map_err(|e| Error::Parse(format!("RoPE sin: {}", e)))?;
+
+            Ok(Self {
+                cos_cache,
+                sin_cache,
+                _head_dim: head_dim,
+            })
+        }
+
+        /// Apply rotary embeddings to query or key tensor.
+        ///
+        /// Input shape: [batch, seq_len, num_heads, head_dim]
+        pub fn apply(&self, x: &Tensor, start_pos: usize) -> Result<Tensor> {
+            let (batch, seq_len, num_heads, head_dim) = x
+                .dims4()
+                .map_err(|e| Error::Parse(format!("RoPE dims: {}", e)))?;
+
+            // Get position-specific cos/sin
+            let cos = self
+                .cos_cache
+                .i((start_pos..start_pos + seq_len, ..))
+                .map_err(|e| Error::Parse(format!("RoPE cos slice: {}", e)))?;
+            let sin = self
+                .sin_cache
+                .i((start_pos..start_pos + seq_len, ..))
+                .map_err(|e| Error::Parse(format!("RoPE sin slice: {}", e)))?;
+
+            // Split x into two halves
+            let half_dim = head_dim / 2;
+            let x1 = x
+                .i((.., .., .., ..half_dim))
+                .map_err(|e| Error::Parse(format!("RoPE x1: {}", e)))?;
+            let x2 = x
+                .i((.., .., .., half_dim..))
+                .map_err(|e| Error::Parse(format!("RoPE x2: {}", e)))?;
+
+            // Rotate: [x1, x2] -> [x1*cos - x2*sin, x1*sin + x2*cos]
+            let cos_exp = cos
+                .unsqueeze(0)
+                .map_err(|e| Error::Parse(format!("RoPE cos unsqueeze: {}", e)))?
+                .unsqueeze(2)
+                .map_err(|e| Error::Parse(format!("RoPE cos unsqueeze2: {}", e)))?;
+            let sin_exp = sin
+                .unsqueeze(0)
+                .map_err(|e| Error::Parse(format!("RoPE sin unsqueeze: {}", e)))?
+                .unsqueeze(2)
+                .map_err(|e| Error::Parse(format!("RoPE sin unsqueeze2: {}", e)))?;
+
+            let x1_cos =
+                (&x1 * &cos_exp).map_err(|e| Error::Parse(format!("RoPE x1*cos: {}", e)))?;
+            let x2_sin =
+                (&x2 * &sin_exp).map_err(|e| Error::Parse(format!("RoPE x2*sin: {}", e)))?;
+            let rotated_x1 =
+                (&x1_cos - &x2_sin).map_err(|e| Error::Parse(format!("RoPE rotated_x1: {}", e)))?;
+
+            let x1_sin =
+                (&x1 * &sin_exp).map_err(|e| Error::Parse(format!("RoPE x1*sin: {}", e)))?;
+            let x2_cos =
+                (&x2 * &cos_exp).map_err(|e| Error::Parse(format!("RoPE x2*cos: {}", e)))?;
+            let rotated_x2 =
+                (&x1_sin + &x2_cos).map_err(|e| Error::Parse(format!("RoPE rotated_x2: {}", e)))?;
+
+            Tensor::cat(&[&rotated_x1, &rotated_x2], D::Minus1)
+                .map_err(|e| Error::Parse(format!("RoPE cat: {}", e)))
+        }
+    }
+
+    // =========================================================================
+    // GeGLU Activation
+    // =========================================================================
+
+    /// GeGLU activation: gate * GELU(x)
+    ///
+    /// Splits input in half, applies GELU to one half, multiplies.
+    /// Better than standard GELU for language modeling.
+    pub fn geglu(x: &Tensor) -> Result<Tensor> {
+        let dim = x.dims().last().copied().unwrap_or(0);
+        let half = dim / 2;
+
+        let gate = x
+            .i((.., ..half))
+            .map_err(|e| Error::Parse(format!("GeGLU gate: {}", e)))?;
+        let x_half = x
+            .i((.., half..))
+            .map_err(|e| Error::Parse(format!("GeGLU x: {}", e)))?;
+
+        // GELU activation on gate using tensor method
+        let gelu_gate = gate
+            .gelu_erf()
+            .map_err(|e| Error::Parse(format!("GeGLU gelu: {}", e)))?;
+
+        (&gelu_gate * &x_half).map_err(|e| Error::Parse(format!("GeGLU mul: {}", e)))
+    }
+
+    // =========================================================================
+    // Transformer Layer
+    // =========================================================================
+
+    /// Self-attention layer.
+    pub struct Attention {
+        q_proj: Linear,
+        k_proj: Linear,
+        v_proj: Linear,
+        o_proj: Linear,
+        num_heads: usize,
+        head_dim: usize,
+        rope: Option<RotaryEmbedding>,
+    }
+
+    impl Attention {
+        /// Create a new attention layer from config and weights.
+        pub fn new(config: &EncoderConfig, vb: VarBuilder, device: &Device) -> Result<Self> {
+            let hidden = config.hidden_size;
+            let num_heads = config.num_attention_heads;
+            if num_heads == 0 {
+                return Err(Error::Retrieval(
+                    "num_attention_heads cannot be zero".into(),
+                ));
+            }
+            let head_dim = hidden / num_heads;
+
+            // BERT uses "self.query", "self.key", "self.value", "output.dense"
+            // The vb already has the "attention" prefix from TransformerLayer
+            let q_proj = linear(hidden, hidden, vb.pp("self.query"))
+                .or_else(|_| linear(hidden, hidden, vb.pp("q_proj")))
+                .map_err(|e| Error::Retrieval(format!("Attention query: {}", e)))?;
+            let k_proj = linear(hidden, hidden, vb.pp("self.key"))
+                .or_else(|_| linear(hidden, hidden, vb.pp("k_proj")))
+                .map_err(|e| Error::Retrieval(format!("Attention key: {}", e)))?;
+            let v_proj = linear(hidden, hidden, vb.pp("self.value"))
+                .or_else(|_| linear(hidden, hidden, vb.pp("v_proj")))
+                .map_err(|e| Error::Retrieval(format!("Attention value: {}", e)))?;
+            let o_proj = linear(hidden, hidden, vb.pp("output.dense"))
+                .or_else(|_| linear(hidden, hidden, vb.pp("o_proj")))
+                .map_err(|e| Error::Retrieval(format!("Attention output: {}", e)))?;
+
+            let rope = if config.use_rope {
+                Some(RotaryEmbedding::new(
+                    head_dim,
+                    config.max_position_embeddings,
+                    config.rope_theta,
+                    device,
+                )?)
+            } else {
+                None
+            };
+
+            Ok(Self {
+                q_proj,
+                k_proj,
+                v_proj,
+                o_proj,
+                num_heads,
+                head_dim,
+                rope,
+            })
+        }
+
+        /// Forward pass through attention layer.
+        pub fn forward(&self, hidden_states: &Tensor, start_pos: usize) -> Result<Tensor> {
+            let (batch, seq_len, hidden) = hidden_states
+                .dims3()
+                .map_err(|e| Error::Parse(format!("Attention dims: {}", e)))?;
+
+            // Project Q, K, V
+            let q = self
+                .q_proj
+                .forward(hidden_states)
+                .map_err(|e| Error::Parse(format!("Attention Q: {}", e)))?;
+            let k = self
+                .k_proj
+                .forward(hidden_states)
+                .map_err(|e| Error::Parse(format!("Attention K: {}", e)))?;
+            let v = self
+                .v_proj
+                .forward(hidden_states)
+                .map_err(|e| Error::Parse(format!("Attention V: {}", e)))?;
+
+            // Validate dimensions before reshape
+            let expected_elements = batch * seq_len * self.num_heads * self.head_dim;
+            let q_elements: usize = q.dims().iter().product();
+            if expected_elements != q_elements {
+                return Err(Error::Parse(format!(
+                    "Reshape dimension mismatch for Q: expected {} elements ({}x{}x{}x{}), got {}",
+                    expected_elements, batch, seq_len, self.num_heads, self.head_dim, q_elements
+                )));
+            }
+
+            // Reshape to [batch, seq, num_heads, head_dim]
+            let q = q.reshape((batch, seq_len, self.num_heads, self.head_dim))?;
+            let k = k.reshape((batch, seq_len, self.num_heads, self.head_dim))?;
+            let v = v.reshape((batch, seq_len, self.num_heads, self.head_dim))?;
+
+            // Apply RoPE if configured
+            let (q, k) = if let Some(rope) = &self.rope {
+                (rope.apply(&q, start_pos)?, rope.apply(&k, start_pos)?)
+            } else {
+                (q, k)
+            };
+
+            // Transpose for attention: [batch, num_heads, seq, head_dim]
+            //
+            // Note: Metal is picky about non-contiguous views for matmul.
+            // Keep these contiguous to avoid backend-specific failures.
+            let q = q.transpose(1, 2)?.contiguous()?;
+            let k = k.transpose(1, 2)?.contiguous()?;
+            let v = v.transpose(1, 2)?.contiguous()?;
+
+            // Scaled dot-product attention
+            if self.head_dim == 0 {
+                return Err(Error::Parse("head_dim cannot be zero".into()));
+            }
+            let scale = (self.head_dim as f64).sqrt(); // Use f64 for Tensor division
+            let kt = k.transpose(2, 3)?.contiguous()?;
+            let attn_weights = (q.matmul(&kt)? / scale)?;
+            let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)
+                .map_err(|e| Error::Parse(format!("Attention softmax: {}", e)))?;
+            let attn_output = attn_weights.contiguous()?.matmul(&v)?;
+
+            // Transpose back and reshape
+            let attn_output = attn_output.transpose(1, 2)?;
+            let attn_output = attn_output.reshape((batch, seq_len, hidden))?;
+
+            // Output projection
+            self.o_proj
+                .forward(&attn_output)
+                .map_err(|e| Error::Parse(format!("Attention output: {}", e)))
+        }
+    }
+
+    /// Feed-forward network (MLP).
+    pub struct FeedForward {
+        up_proj: Linear,
+        down_proj: Linear,
+        use_geglu: bool,
+    }
+
+    impl FeedForward {
+        /// Create a new feed-forward network from config and weights.
+        pub fn new(config: &EncoderConfig, vb: VarBuilder) -> Result<Self> {
+            let hidden = config.hidden_size;
+            let intermediate = if config.use_geglu {
+                // GeGLU doubles the intermediate size then halves it
+                config.intermediate_size * 2
+            } else {
+                config.intermediate_size
+            };
+
+            // BERT uses "intermediate.dense" and "output.dense"
+            let up_proj = linear(hidden, intermediate, vb.pp("intermediate.dense"))
+                .or_else(|_| linear(hidden, intermediate, vb.pp("up_proj")))
+                .map_err(|e| Error::Retrieval(format!("FFN intermediate: {}", e)))?;
+            let down_proj = linear(config.intermediate_size, hidden, vb.pp("output.dense"))
+                .or_else(|_| linear(config.intermediate_size, hidden, vb.pp("down_proj")))
+                .map_err(|e| Error::Retrieval(format!("FFN output: {}", e)))?;
+
+            Ok(Self {
+                up_proj,
+                down_proj,
+                use_geglu: config.use_geglu,
+            })
+        }
+
+        /// Forward pass through FFN.
+        pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+            let up = self
+                .up_proj
+                .forward(x)
+                .map_err(|e| Error::Parse(format!("FFN up: {}", e)))?;
+
+            let activated = if self.use_geglu {
+                geglu(&up)?
+            } else {
+                // Use tensor method for GELU
+                up.gelu_erf()
+                    .map_err(|e| Error::Parse(format!("FFN gelu: {}", e)))?
+            };
+
+            self.down_proj
+                .forward(&activated)
+                .map_err(|e| Error::Parse(format!("FFN down: {}", e)))
+        }
+    }
+
+    /// Transformer layer (attention + FFN).
+    pub struct TransformerLayer {
+        attention: Attention,
+        ffn: FeedForward,
+        ln1: LayerNorm,
+        ln2: LayerNorm,
+        use_pre_norm: bool,
+    }
+
+    impl TransformerLayer {
+        /// Create a new transformer layer from config and weights.
+        pub fn new(config: &EncoderConfig, vb: VarBuilder, device: &Device) -> Result<Self> {
+            // BERT uses "attention" prefix
+            let attention = Attention::new(config, vb.pp("attention"), device)?;
+            // FeedForward is at the same level as attention, so use empty prefix (or just vb)
+            let ffn = FeedForward::new(config, vb.clone())?;
+
+            // BERT uses "attention.output.LayerNorm" and "output.LayerNorm"
+            // Try BERT paths first, then fall back to generic
+            let ln1 = layer_norm(
+                config.hidden_size,
+                config.layer_norm_eps,
+                vb.pp("attention.output.LayerNorm"),
+            )
+            .or_else(|_| layer_norm(config.hidden_size, config.layer_norm_eps, vb.pp("ln1")))
+            .map_err(|e| Error::Retrieval(format!("Layer ln1: {}", e)))?;
+            let ln2 = layer_norm(
+                config.hidden_size,
+                config.layer_norm_eps,
+                vb.pp("output.LayerNorm"),
+            )
+            .or_else(|_| layer_norm(config.hidden_size, config.layer_norm_eps, vb.pp("ln2")))
+            .map_err(|e| Error::Retrieval(format!("Layer ln2: {}", e)))?;
+
+            Ok(Self {
+                attention,
+                ffn,
+                ln1,
+                ln2,
+                use_pre_norm: config.use_pre_norm,
+            })
+        }
+
+        /// Forward pass through transformer layer.
+        ///
+        /// Pre-norm (ModernBERT, GPT-2, DeBERTa): LN -> Attention -> Residual
+        /// Post-norm (classic BERT): Attention -> Residual -> LN
+        pub fn forward(&self, x: &Tensor, start_pos: usize) -> Result<Tensor> {
+            if self.use_pre_norm {
+                // Pre-norm: LN -> Attention -> Residual
+                let normed = self
+                    .ln1
+                    .forward(x)
+                    .map_err(|e| Error::Parse(format!("Layer ln1: {}", e)))?;
+                let attn_out = self.attention.forward(&normed, start_pos)?;
+                let x = (x + attn_out)?;
+
+                // Pre-norm: LN -> FFN -> Residual
+                let normed = self
+                    .ln2
+                    .forward(&x)
+                    .map_err(|e| Error::Parse(format!("Layer ln2: {}", e)))?;
+                let ffn_out = self.ffn.forward(&normed)?;
+                (&x + ffn_out).map_err(|e| Error::Parse(format!("Layer residual: {}", e)))
+            } else {
+                // Post-norm (classic BERT): Attention -> Residual -> LN
+                let attn_out = self.attention.forward(x, start_pos)?;
+                let x = (x + attn_out)?;
+                let x = self
+                    .ln1
+                    .forward(&x)
+                    .map_err(|e| Error::Parse(format!("Layer ln1: {}", e)))?;
+
+                // Post-norm: FFN -> Residual -> LN
+                let ffn_out = self.ffn.forward(&x)?;
+                let x = (&x + ffn_out)?;
+                self.ln2
+                    .forward(&x)
+                    .map_err(|e| Error::Parse(format!("Layer ln2: {}", e)))
+            }
+        }
+    }
+
+    // =========================================================================
+    // Full Encoder
+    // =========================================================================
+
+    /// Pure Rust transformer encoder.
+    pub struct CandleEncoder {
+        config: EncoderConfig,
+        /// Word embeddings
+        embeddings: Embedding,
+        /// Position embeddings (for non-RoPE models like BERT)
+        position_embeddings: Option<Embedding>,
+        /// Token type embeddings (for BERT-style models)
+        token_type_embeddings: Option<Embedding>,
+        /// Embeddings layer norm (BERT adds LN after summing embeddings)
+        embeddings_layer_norm: Option<LayerNorm>,
+        layers: Vec<TransformerLayer>,
+        final_norm: Option<LayerNorm>, // BERT doesn't have this; ModernBERT does
+        tokenizer: Tokenizer,
+        device: Device,
+        architecture_name: String,
+    }
+
+    impl std::fmt::Debug for CandleEncoder {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CandleEncoder")
+                .field("architecture_name", &self.architecture_name)
+                .field("device", &format!("{:?}", self.device))
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl CandleEncoder {
+        /// Create a new encoder with random weights (for testing).
+        pub fn new_random(config: EncoderConfig, tokenizer: Tokenizer, name: &str) -> Result<Self> {
+            let device = best_device()?;
+            let varmap = candle_nn::VarMap::new();
+            let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+
+            let embeddings = embedding(config.vocab_size, config.hidden_size, vb.pp("embeddings"))
+                .map_err(|e| Error::Retrieval(format!("Embeddings: {}", e)))?;
+
+            let mut layers = Vec::new();
+            for i in 0..config.num_hidden_layers {
+                layers.push(TransformerLayer::new(
+                    &config,
+                    vb.pp(format!("layer_{}", i)),
+                    &device,
+                )?);
+            }
+
+            // For random testing, create a final_norm if config needs one (e.g., ModernBERT)
+            let final_norm = if config.use_pre_norm {
+                Some(
+                    layer_norm(
+                        config.hidden_size,
+                        config.layer_norm_eps,
+                        vb.pp("final_norm"),
+                    )
+                    .map_err(|e| Error::Retrieval(format!("Final norm: {}", e)))?,
+                )
+            } else {
+                None // BERT doesn't need final norm
+            };
+
+            Ok(Self {
+                config,
+                embeddings,
+                position_embeddings: None,
+                token_type_embeddings: None,
+                embeddings_layer_norm: None,
+                layers,
+                final_norm,
+                tokenizer,
+                device,
+                architecture_name: name.to_string(),
+            })
+        }
+
+        /// Load encoder from HuggingFace model (safetensors).
+        #[cfg(not(target_arch = "wasm32"))]
+        pub fn from_pretrained(model_id: &str) -> Result<Self> {
+            let api = crate::backends::hf_loader::hf_api()?;
+
+            let repo = api.model(model_id.to_string());
+
+            // Download config, weights, tokenizer
+            // Try config.json first, fall back to gliner_config.json for GLiNER models
+            let config_path = crate::backends::hf_loader::download_model_file(
+                &repo,
+                &["config.json", "gliner_config.json"],
+            )
+            .map_err(|e| {
+                Error::Retrieval(format!(
+                    "config (tried config.json and gliner_config.json): {}",
+                    e
+                ))
+            })?;
+            let weights_path =
+                crate::backends::hf_loader::download_model_file(&repo, &["model.safetensors"])
+                    .or_else(|_| {
+                        // Try to convert pytorch_model.bin to safetensors
+                        let pytorch_path = crate::backends::hf_loader::download_model_file(
+                            &repo,
+                            &["pytorch_model.bin"],
+                        )?;
+                        crate::backends::gliner_candle::convert_pytorch_to_safetensors(
+                            &pytorch_path,
+                        )
+                    })
+                    .map_err(|e| {
+                        Error::Retrieval(format!("weights not found and conversion failed: {}", e))
+                    })?;
+            // Try tokenizer.json first, fall back to vocab.txt for older models
+            let tokenizer_path = crate::backends::hf_loader::download_model_file(
+                &repo,
+                &["tokenizer.json", "vocab.txt"],
+            )
+            .map_err(|e| {
+                Error::Retrieval(format!(
+                    "tokenizer: neither tokenizer.json nor vocab.txt found: {}",
+                    e
+                ))
+            })?;
+
+            // Parse config
+            let config_str = std::fs::read_to_string(&config_path)
+                .map_err(|e| Error::Retrieval(format!("read config: {}", e)))?;
+            let config = Self::parse_config(&config_str)?;
+
+            // Load tokenizer - handle both tokenizer.json and vocab.txt
+            let tokenizer = if tokenizer_path.ends_with("tokenizer.json") {
+                Tokenizer::from_file(&tokenizer_path)
+                    .map_err(|e| Error::Retrieval(format!("tokenizer: {}", e)))?
+            } else if tokenizer_path.ends_with("vocab.txt") {
+                // Create a BERT tokenizer from vocab.txt
+                use tokenizers::models::wordpiece::WordPiece;
+                use tokenizers::normalizers::bert::BertNormalizer;
+                use tokenizers::pre_tokenizers::bert::BertPreTokenizer;
+                use tokenizers::processors::bert::BertProcessing;
+                use tokenizers::Tokenizer as TokenizerImpl;
+
+                let vocab_str = tokenizer_path
+                    .to_str()
+                    .ok_or_else(|| Error::Retrieval("Invalid tokenizer path".to_string()))?;
+
+                let model = WordPiece::from_file(vocab_str).build().map_err(|e| {
+                    Error::Retrieval(format!("Failed to create WordPiece from vocab.txt: {}", e))
+                })?;
+
+                let mut tokenizer_impl = TokenizerImpl::new(model);
+                // Use cased normalizer for NER - case is important for detecting names!
+                // BertNormalizer::default() lowercases which breaks NER
+                tokenizer_impl.with_normalizer(Some(BertNormalizer::new(
+                    false, // clean_text
+                    true,  // handle_chinese_chars
+                    None,  // strip_accents - None means don't strip
+                    false, // lowercase - CRITICAL: keep case for NER!
+                )));
+                tokenizer_impl.with_pre_tokenizer(Some(BertPreTokenizer));
+                tokenizer_impl.with_post_processor(Some(BertProcessing::default()));
+
+                tokenizer_impl
+            } else {
+                return Err(Error::Retrieval(format!(
+                    "Unsupported tokenizer format: {}. Expected tokenizer.json or vocab.txt.",
+                    tokenizer_path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                )));
+            };
+
+            // Load weights
+            let device = best_device()?;
+            // SAFETY: VarBuilder::from_mmaped_safetensors uses unsafe internally for memory mapping.
+            // The weights_path is validated to exist before this call, and the safetensors format
+            // is validated by the library. This is a safe FFI boundary.
+            let vb = unsafe {
+                VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F32, &device)
+                    .map_err(|e| Error::Retrieval(format!("safetensors: {}", e)))?
+            };
+
+            // Try different embedding paths (models may use different naming)
+            // BERT models use "embeddings.word_embeddings.weight" in safetensors
+            let embeddings = embedding(
+                config.vocab_size,
+                config.hidden_size,
+                vb.pp("embeddings.word_embeddings"),
+            )
+            .or_else(|_| {
+                embedding(
+                    config.vocab_size,
+                    config.hidden_size,
+                    vb.pp("bert.embeddings.word_embeddings"),
+                )
+            })
+            .or_else(|_| {
+                embedding(
+                    config.vocab_size,
+                    config.hidden_size,
+                    vb.pp("word_embeddings"),
+                )
+            })
+            .or_else(|_| {
+                // Try with .weight suffix (some safetensors formats)
+                embedding(
+                    config.vocab_size,
+                    config.hidden_size,
+                    vb.pp("embeddings.word_embeddings.weight"),
+                )
+            })
+            .or_else(|_| {
+                embedding(
+                    config.vocab_size,
+                    config.hidden_size,
+                    vb.pp("bert.embeddings.word_embeddings.weight"),
+                )
+            })
+            .map_err(|e| {
+                Error::Retrieval(format!(
+                    "Embeddings: tried multiple paths - all failed. Error: {}",
+                    e
+                ))
+            })?;
+
+            // Position embeddings (for non-RoPE models like BERT)
+            let position_embeddings = if !config.use_rope {
+                embedding(
+                    config.max_position_embeddings,
+                    config.hidden_size,
+                    vb.pp("embeddings.position_embeddings"),
+                )
+                .or_else(|_| {
+                    embedding(
+                        config.max_position_embeddings,
+                        config.hidden_size,
+                        vb.pp("bert.embeddings.position_embeddings"),
+                    )
+                })
+                .ok()
+            } else {
+                None
+            };
+
+            // Token type embeddings (BERT has 2 token types)
+            let token_type_embeddings = embedding(
+                2,
+                config.hidden_size,
+                vb.pp("embeddings.token_type_embeddings"),
+            )
+            .or_else(|_| {
+                embedding(
+                    2,
+                    config.hidden_size,
+                    vb.pp("bert.embeddings.token_type_embeddings"),
+                )
+            })
+            .ok();
+
+            // Embeddings layer norm
+            let embeddings_layer_norm = layer_norm(
+                config.hidden_size,
+                config.layer_norm_eps,
+                vb.pp("embeddings.LayerNorm"),
+            )
+            .or_else(|_| {
+                layer_norm(
+                    config.hidden_size,
+                    config.layer_norm_eps,
+                    vb.pp("bert.embeddings.LayerNorm"),
+                )
+            })
+            .ok();
+
+            let mut layers = Vec::new();
+            for i in 0..config.num_hidden_layers {
+                // Try different layer paths
+                let layer =
+                    TransformerLayer::new(&config, vb.pp(format!("encoder.layer.{}", i)), &device)
+                        .or_else(|_| {
+                            TransformerLayer::new(&config, vb.pp(format!("layer.{}", i)), &device)
+                        })
+                        .or_else(|_| {
+                            TransformerLayer::new(
+                                &config,
+                                vb.pp(format!("bert.encoder.layer.{}", i)),
+                                &device,
+                            )
+                        })
+                        .map_err(|e| Error::Retrieval(format!("Layer {}: {}", i, e)))?;
+                layers.push(layer);
+            }
+
+            // BERT models typically don't have a separate final_layer_norm
+            // The last layer's output is the final output
+            // Some models have it, some don't - make it optional
+            let final_norm = layer_norm(
+                config.hidden_size,
+                config.layer_norm_eps,
+                vb.pp("encoder.final_layer_norm"),
+            )
+            .or_else(|_| {
+                layer_norm(
+                    config.hidden_size,
+                    config.layer_norm_eps,
+                    vb.pp("final_layer_norm"),
+                )
+            })
+            .or_else(|_| {
+                layer_norm(
+                    config.hidden_size,
+                    config.layer_norm_eps,
+                    vb.pp("bert.encoder.final_layer_norm"),
+                )
+            })
+            .ok(); // None if not found - BERT models don't have final layer norm
+
+            // Detect architecture
+            let arch_name = if config.use_rope {
+                "ModernBERT"
+            } else {
+                "BERT"
+            };
+
+            Ok(Self {
+                config,
+                embeddings,
+                position_embeddings,
+                token_type_embeddings,
+                embeddings_layer_norm,
+                layers,
+                final_norm,
+                tokenizer,
+                device,
+                architecture_name: arch_name.to_string(),
+            })
+        }
+
+        /// Load encoder from shared VarBuilder and tokenizer.
+        ///
+        /// Use this when the encoder and classifier share the same safetensors file.
+        /// The `vb` should already be prefixed appropriately (e.g., `vb.pp("bert")` for BERT models).
+        pub fn from_vb(
+            config: EncoderConfig,
+            vb: VarBuilder,
+            tokenizer: Tokenizer,
+            device: Device,
+        ) -> Result<Self> {
+            log::debug!(
+                "[CandleEncoder::from_vb] Loading with config: vocab_size={}, hidden_size={}",
+                config.vocab_size,
+                config.hidden_size
+            );
+
+            // Word embeddings - try multiple paths
+            let embeddings = embedding(
+                config.vocab_size,
+                config.hidden_size,
+                vb.pp("embeddings.word_embeddings"),
+            )
+            .or_else(|_| {
+                embedding(
+                    config.vocab_size,
+                    config.hidden_size,
+                    vb.pp("word_embeddings"),
+                )
+            })
+            .map_err(|e| {
+                Error::Retrieval(format!(
+                    "Embeddings: tried multiple paths - all failed. Error: {}",
+                    e
+                ))
+            })?;
+
+            // Position embeddings (for non-RoPE models like BERT)
+            let position_embeddings = if !config.use_rope {
+                embedding(
+                    config.max_position_embeddings,
+                    config.hidden_size,
+                    vb.pp("embeddings.position_embeddings"),
+                )
+                .or_else(|_| {
+                    embedding(
+                        config.max_position_embeddings,
+                        config.hidden_size,
+                        vb.pp("position_embeddings"),
+                    )
+                })
+                .ok()
+            } else {
+                None
+            };
+
+            // Token type embeddings
+            let token_type_embeddings = embedding(
+                2,
+                config.hidden_size,
+                vb.pp("embeddings.token_type_embeddings"),
+            )
+            .or_else(|_| embedding(2, config.hidden_size, vb.pp("token_type_embeddings")))
+            .ok();
+
+            // Embeddings layer norm
+            let embeddings_layer_norm = layer_norm(
+                config.hidden_size,
+                config.layer_norm_eps,
+                vb.pp("embeddings.LayerNorm"),
+            )
+            .or_else(|_| {
+                layer_norm(
+                    config.hidden_size,
+                    config.layer_norm_eps,
+                    vb.pp("LayerNorm"),
+                )
+            })
+            .ok();
+
+            // Transformer layers
+            let mut layers = Vec::new();
+            for i in 0..config.num_hidden_layers {
+                let layer =
+                    TransformerLayer::new(&config, vb.pp(format!("encoder.layer.{}", i)), &device)
+                        .or_else(|_| {
+                            TransformerLayer::new(&config, vb.pp(format!("layer.{}", i)), &device)
+                        })
+                        .map_err(|e| Error::Retrieval(format!("Layer {}: {}", i, e)))?;
+                layers.push(layer);
+            }
+
+            // Final norm - BERT doesn't have this (None), ModernBERT does (Some)
+            let final_norm = layer_norm(
+                config.hidden_size,
+                config.layer_norm_eps,
+                vb.pp("encoder.final_layer_norm"),
+            )
+            .or_else(|_| {
+                layer_norm(
+                    config.hidden_size,
+                    config.layer_norm_eps,
+                    vb.pp("final_layer_norm"),
+                )
+            })
+            .ok(); // None if not found - BERT models don't have final layer norm
+
+            let arch_name = if config.use_rope {
+                "ModernBERT"
+            } else {
+                "BERT"
+            };
+
+            Ok(Self {
+                config,
+                embeddings,
+                position_embeddings,
+                token_type_embeddings,
+                embeddings_layer_norm,
+                layers,
+                final_norm,
+                tokenizer,
+                device,
+                architecture_name: arch_name.to_string(),
+            })
+        }
+
+        /// Parse encoder config from model config.json content.
+        pub fn parse_config(json: &str) -> Result<EncoderConfig> {
+            let v: serde_json::Value = serde_json::from_str(json)
+                .map_err(|e| Error::Parse(format!("config JSON: {}", e)))?;
+
+            // Detect architecture from model_type
+            let model_type = v["model_type"].as_str().unwrap_or("bert");
+            let is_modern = model_type.contains("modern") || v.get("rope_theta").is_some();
+
+            // Classic BERT uses post-norm (Attention -> Residual -> LN)
+            // ModernBERT, DeBERTa, GPT-2 use pre-norm (LN -> Attention -> Residual)
+            let use_pre_norm = is_modern
+                || model_type.contains("deberta")
+                || model_type.contains("gpt")
+                || model_type.contains("roberta"); // RoBERTa also uses pre-norm
+
+            Ok(EncoderConfig {
+                vocab_size: v["vocab_size"].as_u64().unwrap_or(30522) as usize,
+                hidden_size: v["hidden_size"].as_u64().unwrap_or(768) as usize,
+                num_attention_heads: v["num_attention_heads"].as_u64().unwrap_or(12) as usize,
+                num_hidden_layers: v["num_hidden_layers"].as_u64().unwrap_or(12) as usize,
+                intermediate_size: v["intermediate_size"].as_u64().unwrap_or(3072) as usize,
+                max_position_embeddings: v["max_position_embeddings"].as_u64().unwrap_or(512)
+                    as usize,
+                hidden_dropout_prob: v["hidden_dropout_prob"].as_f64().unwrap_or(0.1) as f32,
+                layer_norm_eps: v["layer_norm_eps"].as_f64().unwrap_or(1e-12),
+                use_rope: is_modern,
+                use_geglu: is_modern,
+                rope_theta: v["rope_theta"].as_f64().unwrap_or(10000.0),
+                use_pre_norm,
+            })
+        }
+
+        fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
+            let (_batch_size, seq_len) = input_ids
+                .dims2()
+                .map_err(|e| Error::Parse(format!("Input dims: {}", e)))?;
+
+            // Helper to compute L2 norm
+            fn tensor_norm(t: &Tensor) -> f32 {
+                t.flatten_all()
+                    .and_then(|t| t.to_vec1::<f32>())
+                    .map(|v| v.iter().map(|x| x * x).sum::<f32>().sqrt())
+                    .unwrap_or(0.0)
+            }
+
+            // Word embeddings
+            let mut hidden = self
+                .embeddings
+                .forward(input_ids)
+                .map_err(|e| Error::Parse(format!("Word embeddings forward: {}", e)))?;
+            log::trace!("[Encoder] After word_emb: norm={:.4}", tensor_norm(&hidden));
+
+            // Position embeddings (for non-RoPE models like BERT)
+            if let Some(ref pos_emb) = self.position_embeddings {
+                // Create position ids [0, 1, 2, ..., seq_len-1]
+                let position_ids: Vec<i64> = (0..seq_len as i64).collect();
+                let position_ids_tensor =
+                    Tensor::from_vec(position_ids, (1, seq_len), &self.device)
+                        .map_err(|e| Error::Parse(format!("Position ids tensor: {}", e)))?;
+                let pos_embeddings = pos_emb
+                    .forward(&position_ids_tensor)
+                    .map_err(|e| Error::Parse(format!("Position embeddings forward: {}", e)))?;
+                hidden = (&hidden + &pos_embeddings)
+                    .map_err(|e| Error::Parse(format!("Add position embeddings: {}", e)))?;
+                log::trace!("[Encoder] After pos_emb: norm={:.4}", tensor_norm(&hidden));
+            } else {
+                log::trace!("[Encoder] No position embeddings loaded");
+            }
+
+            // Token type embeddings (for BERT-style models)
+            if let Some(ref tte) = self.token_type_embeddings {
+                // All zeros for single-sequence NER
+                let token_type_ids: Vec<i64> = vec![0i64; seq_len];
+                let tti_tensor = Tensor::from_vec(token_type_ids, (1, seq_len), &self.device)
+                    .map_err(|e| Error::Parse(format!("Token type ids tensor: {}", e)))?;
+                let token_type_emb = tte
+                    .forward(&tti_tensor)
+                    .map_err(|e| Error::Parse(format!("Token type embeddings forward: {}", e)))?;
+                hidden = (&hidden + &token_type_emb)
+                    .map_err(|e| Error::Parse(format!("Add token type embeddings: {}", e)))?;
+                log::trace!(
+                    "[Encoder] After token_type_emb: norm={:.4}",
+                    tensor_norm(&hidden)
+                );
+            } else {
+                log::trace!("[Encoder] No token type embeddings loaded");
+            }
+
+            // Embeddings layer norm
+            if let Some(ref ln) = self.embeddings_layer_norm {
+                hidden = ln
+                    .forward(&hidden)
+                    .map_err(|e| Error::Parse(format!("Embeddings layer norm: {}", e)))?;
+                log::trace!("[Encoder] After emb_ln: norm={:.4}", tensor_norm(&hidden));
+            } else {
+                log::trace!("[Encoder] No embeddings layer norm loaded");
+            }
+
+            // Pass through layers
+            for (i, layer) in self.layers.iter().enumerate() {
+                hidden = layer.forward(&hidden, 0)?;
+                if i == 0 || i == 11 {
+                    log::trace!(
+                        "[Encoder] After layer {}: norm={:.4}",
+                        i,
+                        tensor_norm(&hidden)
+                    );
+                }
+            }
+
+            // Final norm - only apply if present (ModernBERT has it, BERT doesn't)
+            if let Some(ref final_norm) = self.final_norm {
+                let result = final_norm
+                    .forward(&hidden)
+                    .map_err(|e| Error::Parse(format!("final_norm: {}", e)))?;
+                log::trace!(
+                    "[Encoder] After final_norm: norm={:.4}",
+                    tensor_norm(&result)
+                );
+                Ok(result)
+            } else {
+                log::trace!(
+                    "[Encoder] No final_norm (BERT-style), returning hidden as-is. Norm={:.4}",
+                    tensor_norm(&hidden)
+                );
+                Ok(hidden)
+            }
+        }
+    }
+
+    impl CandleTextEncoder for CandleEncoder {
+        fn encode(&self, text: &str) -> Result<(Vec<f32>, usize)> {
+            // Tokenize
+            let encoding = self
+                .tokenizer
+                .encode(text, true)
+                .map_err(|e| Error::Parse(format!("Tokenize: {}", e)))?;
+
+            let input_ids: Vec<i64> = encoding.get_ids().iter().map(|&x| x as i64).collect();
+            let seq_len = input_ids.len().min(self.config.max_position_embeddings);
+            let input_ids = &input_ids[..seq_len];
+
+            // Create tensor
+            let input_tensor = Tensor::from_vec(input_ids.to_vec(), (1, seq_len), &self.device)
+                .map_err(|e| Error::Parse(format!("Input tensor: {}", e)))?;
+
+            // Forward pass
+            let output = self.forward(&input_tensor)?;
+
+            // Extract to CPU
+            let output_flat = output
+                .flatten_all()
+                .map_err(|e| Error::Parse(format!("Flatten: {}", e)))?;
+            let embeddings = output_flat
+                .to_vec1::<f32>()
+                .map_err(|e| Error::Parse(format!("To vec: {}", e)))?;
+
+            Ok((embeddings, seq_len))
+        }
+
+        fn hidden_dim(&self) -> usize {
+            self.config.hidden_size
+        }
+
+        fn max_length(&self) -> usize {
+            self.config.max_position_embeddings
+        }
+
+        fn architecture(&self) -> &str {
+            &self.architecture_name
+        }
+    }
+
+    impl CandleEncoder {
+        /// Encode text and return embeddings along with token offsets.
+        ///
+        /// # Returns
+        /// - Token embeddings: `[seq_len, hidden_dim]` (flattened)
+        /// - Sequence length
+        /// - Token offsets (byte_start, byte_end) for each token (tokenizers uses byte indices in Rust)
+        #[allow(clippy::type_complexity)]
+        pub fn encode_with_offsets(
+            &self,
+            text: &str,
+        ) -> Result<(Vec<f32>, usize, Vec<(usize, usize)>)> {
+            // Tokenize
+            let encoding = self
+                .tokenizer
+                .encode(text, true)
+                .map_err(|e| Error::Parse(format!("Tokenize: {}", e)))?;
+
+            let input_ids: Vec<i64> = encoding.get_ids().iter().map(|&x| x as i64).collect();
+            let seq_len = input_ids.len().min(self.config.max_position_embeddings);
+            let input_ids = &input_ids[..seq_len];
+
+            // Debug: Show tokens
+            let tokens = encoding.get_tokens();
+            log::trace!("[Encoder] Input IDs: {:?}", input_ids);
+            log::trace!("[Encoder] Tokens: {:?}", tokens);
+
+            // Get offsets
+            let offsets: Vec<(usize, usize)> = encoding
+                .get_offsets()
+                .iter()
+                .take(seq_len)
+                .copied()
+                .collect();
+
+            // Create tensor
+            let input_tensor = Tensor::from_vec(input_ids.to_vec(), (1, seq_len), &self.device)
+                .map_err(|e| Error::Parse(format!("Input tensor: {}", e)))?;
+
+            // Forward pass
+            let output = self.forward(&input_tensor)?;
+
+            // Extract to CPU
+            let output_flat = output
+                .flatten_all()
+                .map_err(|e| Error::Parse(format!("Flatten: {}", e)))?;
+            let embeddings = output_flat
+                .to_vec1::<f32>()
+                .map_err(|e| Error::Parse(format!("To vec: {}", e)))?;
+
+            Ok((embeddings, seq_len, offsets))
+        }
+    }
+}

@@ -1,0 +1,14 @@
+[ontology]
+id = "business"
+version = "1"
+
+[ontology.entities.person]
+description = "A person mentioned in source material"
+
+[ontology.entities.company]
+description = "A company mentioned in source material"
+
+[ontology.predicates.manages]
+description = "A person manages a company"
+subject_types = ["person"]
+object_types = ["company"]

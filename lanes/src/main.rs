@@ -1,310 +1,463 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use aurelius_lanes::{
-    airbyte::Airbyte,
-    config::{Config, Mode},
-    processor::BundledEmbedder,
-    store::{MIGRATIONS, Store, fingerprint},
-    worker::Worker,
+    config::Config,
+    facts::ChatExtractor,
+    worker::{ExtractionRequest, extract_document},
 };
-use axum::{
-    Json, Router,
-    extract::{DefaultBodyLimit, Path, State},
-    http::{HeaderMap, StatusCode},
-    routing::{get, post},
+#[cfg(feature = "postgres")]
+use aurelius_lanes::{
+    ingest::{IngestRequest, PgIngestor, ingest_once},
+    lanes::LaneError,
 };
-use serde::Deserialize;
-use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-use sqlx::postgres::PgPoolOptions;
-use std::{sync::Arc, time::Duration};
-use subtle::ConstantTimeEq;
-
-#[derive(Clone)]
-struct App {
-    worker: Worker,
-    operator_token: String,
-    webhook_token: String,
-    webhook_org: String,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Search {
-    organization_id: String,
-    query: String,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Reconcile {
-    organization_id: String,
-}
-fn same_secret(a: &str, b: &str) -> bool {
-    Sha256::digest(a.as_bytes())
-        .ct_eq(&Sha256::digest(b.as_bytes()))
-        .into()
-}
-fn authorized(headers: &HeaderMap, token: &str) -> bool {
-    headers
-        .get("authorization")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|v| same_secret(v, token))
-}
-fn registered(app: &App, organization: &str) -> bool {
-    app.worker
-        .config
-        .lanes
-        .iter()
-        .any(|l| l.enabled && l.organization_id == organization)
-}
-async fn health(State(app): State<Arc<App>>) -> StatusCode {
-    if sqlx::query("SELECT 1")
-        .execute(&app.worker.store.pool)
-        .await
-        .is_ok()
-        && reqwest::Client::new()
-            .get("http://127.0.0.1:8081/health")
-            .timeout(Duration::from_secs(3))
-            .send()
-            .await
-            .is_ok_and(|r| r.status().is_success())
-    {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    }
-}
-async fn webhook(
-    State(app): State<Arc<App>>,
-    Path(token): Path<String>,
-    Json(_body): Json<Value>,
-) -> StatusCode {
-    if !same_secret(&token, &app.webhook_token) {
-        return StatusCode::UNAUTHORIZED;
-    }
-    // Airbyte webhook formats vary by version. Treat it as a hint and resolve job IDs via its API.
-    match app.worker.store.request_reconcile(&app.webhook_org).await {
-        Ok(()) => StatusCode::ACCEPTED,
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
-    }
-}
-async fn reconcile(
-    State(app): State<Arc<App>>,
-    headers: HeaderMap,
-    Json(body): Json<Reconcile>,
-) -> StatusCode {
-    if !authorized(&headers, &app.operator_token) {
-        return StatusCode::UNAUTHORIZED;
-    }
-    if !registered(&app, &body.organization_id) {
-        return StatusCode::BAD_REQUEST;
-    }
-    match app
-        .worker
-        .store
-        .request_reconcile(&body.organization_id)
-        .await
-    {
-        Ok(()) => StatusCode::ACCEPTED,
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
-    }
-}
-async fn search(
-    State(app): State<Arc<App>>,
-    headers: HeaderMap,
-    Json(body): Json<Search>,
-) -> std::result::Result<Json<Value>, StatusCode> {
-    if !authorized(&headers, &app.operator_token) {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-    if !registered(&app, &body.organization_id)
-        || body.query.trim().is_empty()
-        || body.query.len() > 4000
-    {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    let lanes: Vec<_> = app
-        .worker
-        .config
-        .lanes
-        .iter()
-        .filter(|l| {
-            l.enabled && l.mode == Mode::Content && l.organization_id == body.organization_id
-        })
-        .collect();
-    let fingerprints: Vec<String> = lanes
-        .iter()
-        .map(|l| fingerprint(l))
-        .collect::<Result<_>>()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let lane_names = lanes.iter().map(|l| l.name.clone()).collect::<Vec<_>>();
-    let vector = BundledEmbedder
-        .query(&body.query)
-        .await
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    let hits = app
-        .worker
-        .store
-        .search(
-            &body.organization_id,
-            &lane_names,
-            &fingerprints,
-            &body.query,
-            vector,
-        )
-        .await
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    Ok(Json(json!({"hits":hits})))
-}
-fn crate_limit() -> u64 {
-    aurelius_lanes::processor::MAX_OBJECT_BYTES as u64 + 1
-}
-async fn shutdown() {
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .expect("register SIGTERM");
-    tokio::select! {_=tokio::signal::ctrl_c()=>{},_=terminate.recv()=>{}}
-}
+use std::path::Path;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "aurelius_lanes=info".into()),
         )
         .init();
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let mode = args.first().map(String::as_str).unwrap_or("serve");
-    if mode == "validate" {
-        let path = args.get(1).context("usage: validate <config> [lane]")?;
-        let config = Config::load(std::path::Path::new(path))?;
-        if let Some(name) = args.get(2) {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    ensure!(
+        if args.first().is_some_and(|a| a == "index-record") {
+            args.len() == 6
+        } else if args.first().is_some_and(|a| a == "pilot-facts") {
+            args.len() == 4
+        } else if args.first().is_some_and(|a| matches!(
+            a.as_str(),
+            "facts-once" | "watch-facts" | "fact-context" | "prepare-facts"
+        )) {
+            args.len() == 3
+        } else {
+            args.len() == 2
+        },
+        "usage: aurelius-lanes <validate|extract|store|index-lanes|watch-lanes|worker|start-lanes|notify-lanes|status-lanes|status-legacy-lanes|schedule-lanes|checkpoint-lanes|start-facts|status-facts> <config.toml>; index-record <config.toml> <lane> <job-id> <object-key> <row-index>; pilot-facts <config.toml> <org-id> <source-artifact-id>; facts-once|watch-facts <config.toml> <org-id>"
+    );
+    let config = Config::load(Path::new(&args[1]))?;
+    match args[0].as_str() {
+        "validate" => {
+            println!("ontology_hash={}", config.ontology.semantic_hash()?);
+            for name in config.lanes.keys() {
+                println!("lane={name} profile={}", config.lane_request(name)?.profile);
+            }
+            if let Some(chat) = &config.chat {
+                println!(
+                    "extraction_profile={}",
+                    ChatExtractor::new(chat, config.ontology)?.profile
+                );
+            }
+        }
+        #[cfg(all(feature = "postgres", feature = "temporal"))]
+        "checkpoint-lanes" => {
+            let temporal = config
+                .temporal
+                .as_ref()
+                .context("Temporal configuration required")?;
+            let client = aurelius_lanes::temporal::connect(temporal).await?;
+            let mut bytes = Vec::new();
+            tokio::io::stdin()
+                .take(256 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .await?;
+            ensure!(bytes.len() <= 256 * 1024, "checkpoint input exceeds bound");
+            let receipts: Vec<aurelius_lanes::ingest::IngestReceipt> =
+                serde_json::from_slice(&bytes)?;
+            ensure!(receipts.len() <= config.lanes.len(), "too many checkpoints");
+            let sink = aurelius_lanes::postgres::PostgresSink::connect(
+                config
+                    .postgres
+                    .clone()
+                    .context("Postgres configuration required")?,
+                config
+                    .embedding
+                    .as_ref()
+                    .context("embedding configuration required")?
+                    .dimensions,
+            )
+            .await?;
+            let source = aurelius_lanes::source::SourceClient::new(
+                config
+                    .source
+                    .clone()
+                    .context("source configuration required")?,
+            )?;
+            let mut seen = std::collections::BTreeSet::new();
+            for receipt in receipts {
+                let name = &receipt.epoch.request.lane.lane;
+                ensure!(
+                    seen.insert(name.clone())
+                        && config.lane_request(name)? == receipt.epoch.request.lane,
+                    "checkpoint changed lane identity"
+                );
+                let lane = &config.lanes[name];
+                let legacy = format!(
+                    "aurelius-pg/{}/{}/{}",
+                    lane.scope, name, receipt.epoch.request.lane.profile
+                );
+                ensure!(
+                    !aurelius_lanes::temporal_ingest::is_running(&client, &legacy).await?,
+                    "legacy observer must be stopped before importing its completed cursor"
+                );
+                source
+                    .verify(&lane.connection, receipt.epoch.sequence)
+                    .await?;
+                sink.record_ingestion(&lane.scope, &receipt).await?;
+                println!(
+                    "lane={name} completed_epoch={} checkpointed",
+                    receipt.epoch.sequence
+                );
+            }
+        }
+        #[cfg(feature = "postgres")]
+        "store" => {
+            let postgres = config.postgres.context("Postgres configuration required")?;
+            let dimensions = config
+                .embedding
+                .context("embedding configuration required")?
+                .dimensions;
+            let sink =
+                aurelius_lanes::postgres::PostgresSink::connect(postgres, dimensions).await?;
+            let mut input = tokio::io::BufReader::new(tokio::io::stdin());
+            loop {
+                let mut line = String::new();
+                let read = (&mut input)
+                    .take(64 * 1024 * 1024 + 1)
+                    .read_line(&mut line)
+                    .await?;
+                if read == 0 {
+                    break;
+                }
+                ensure!(
+                    line.len() <= 64 * 1024 * 1024,
+                    "indexed document input exceeds bound"
+                );
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let document: aurelius_lanes::indexing::IndexedDocument =
+                    serde_json::from_str(&line).map_err(|_| {
+                        anyhow::anyhow!("invalid indexed document input; source details withheld")
+                    })?;
+                println!("{}", serde_json::to_string(&sink.write(&document).await?)?);
+            }
+        }
+        #[cfg(feature = "postgres")]
+        "index-record" => {
+            let engine = PgIngestor::new(config.clone()).await?;
+            let artifact = engine
+                .index_record(&args[2], args[3].parse()?, &args[4], args[5].parse()?)
+                .await?;
+            println!(
+                "{}",
+                serde_json::json!({"source_artifact":artifact,"status":"indexed"})
+            );
+        }
+        #[cfg(feature = "postgres")]
+        "pilot-facts" => {
+            use aurelius_lanes::{contracts::Chunk, postgres::PostgresSink};
+            let settings = config
+                .chat
+                .as_ref()
+                .context("chat configuration required")?;
+            ensure!(
+                settings.gateway.is_some(),
+                "fact pilot requires an authenticated gateway; direct-provider fallback is disabled"
+            );
+            let sink = PostgresSink::connect(
+                config
+                    .postgres
+                    .clone()
+                    .context("Postgres configuration required")?,
+                config
+                    .embedding
+                    .as_ref()
+                    .context("embedding configuration required")?
+                    .dimensions,
+            )
+            .await?;
+            let input = sink.extraction_input(&args[2], &args[3]).await?;
+            let references = settings.references.resolve(&input.document)?;
+            let extractor = ChatExtractor::new(settings, config.ontology)?;
+            for range in input.ranges.into_iter().take(2) {
+                let chunk = Chunk {
+                    document: input.document.clone(),
+                    range,
+                };
+                if sink.candidate_exists(&chunk, &extractor.profile).await? {
+                    println!(
+                        "{}",
+                        serde_json::json!({"candidate_artifact":PostgresSink::candidate_id(&chunk,&extractor.profile)?,"status":"already_stored"})
+                    );
+                    continue;
+                }
+                let graph = extractor.extract(&chunk).await?;
+                let artifact = sink.write_candidates(&chunk, &graph, &references).await?;
+                println!(
+                    "{}",
+                    serde_json::json!({"candidate_artifact":artifact,"claims":graph.claims.len(),"org_id":graph.document.scope,"status":"candidate"})
+                );
+            }
+        }
+        #[cfg(feature = "postgres")]
+        "facts-once" | "watch-facts" => {
+            use aurelius_lanes::enrichment::{FactEngine, enrich_once};
+            let mut engine = FactEngine::new(config.clone()).await?;
+            let request = engine.request(&args[2])?;
+            loop {
+                match enrich_once(&mut engine, request.clone()).await {
+                    Ok(Some(receipt)) => println!("{}", serde_json::to_string(&receipt)?),
+                    Ok(None) => {
+                        if args[0] == "watch-facts" {
+                            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                        }
+                    }
+                    Err(_) => {
+                        if args[0] == "facts-once" {
+                            bail!("fact processing failed; source details withheld");
+                        }
+                        tracing::warn!("fact processing failed; retrying after timer");
+                        tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                    }
+                }
+                if args[0] == "facts-once" {
+                    break;
+                }
+            }
+        }
+        #[cfg(all(feature = "temporal", feature = "postgres"))]
+        "start-facts" | "status-facts" => {
+            use temporalio_client::{WorkflowIdConflictPolicy, WorkflowStartOptions};
+            let temporal = config
+                .temporal
+                .as_ref()
+                .context("Temporal configuration required")?;
+            let client = aurelius_lanes::temporal::connect(temporal).await?;
+            for request in aurelius_lanes::enrichment::FactEngine::requests(&config)? {
+                let id = format!("aurelius-facts/{}/{}", request.scope, request.profile);
+                if args[0] == "start-facts" {
+                    client
+                        .start_workflow(
+                            aurelius_lanes::temporal_facts::FactObserver::run,
+                            request,
+                            WorkflowStartOptions::new(&temporal.task_queue, &id)
+                                .id_conflict_policy(WorkflowIdConflictPolicy::UseExisting)
+                                .build(),
+                        )
+                        .await?;
+                    println!("workflow={id} started_or_existing");
+                } else {
+                    println!(
+                        "{}",
+                        serde_json::json!({"workflow":id,"status":aurelius_lanes::temporal_facts::status(&client,&id).await?})
+                    );
+                }
+            }
+        }
+        #[cfg(all(feature = "postgres", feature = "language"))]
+        "prepare-facts" => {
             use std::io::Read;
             let mut bytes = Vec::new();
-            std::io::stdin()
-                .take(crate_limit())
+            std::fs::File::open(&args[2])?
+                .take(8 * 1024 * 1024 + 1)
                 .read_to_end(&mut bytes)?;
-            let docs = aurelius_lanes::processor::parse_batch(&bytes, config.lane(name)?)?;
-            println!("validated_records={}", docs.len());
-        } else {
-            println!("validated_lanes={}", config.lanes.len());
+            ensure!(
+                bytes.len() <= 8 * 1024 * 1024,
+                "fact preparation request exceeds bound"
+            );
+            let request: aurelius_lanes::fact_preparation::PreparationRequest =
+                serde_json::from_slice(&bytes)?;
+            let sink = aurelius_lanes::postgres::PostgresSink::connect(
+                config
+                    .postgres
+                    .clone()
+                    .context("Postgres configuration required")?,
+                config
+                    .embedding
+                    .as_ref()
+                    .context("embedding configuration required")?
+                    .dimensions,
+            )
+            .await?;
+            let preparer =
+                aurelius_lanes::fact_preparation::FactPreparer::with_sink(&config, sink)?;
+            println!(
+                "{}",
+                serde_json::to_string(
+                    &preparer
+                        .prepare(request.document, request.effective_at)
+                        .await?
+                )?
+            );
         }
-        return Ok(());
-    }
-    let pool = PgPoolOptions::new()
-        .max_connections(4)
-        .acquire_timeout(Duration::from_secs(10))
-        .after_connect(|connection, _| {
-            Box::pin(async move {
-                sqlx::query("SET search_path = lake_ingestion, public")
-                    .execute(connection)
+        #[cfg(feature = "postgres")]
+        "fact-context" => {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            std::fs::File::open(&args[2])?
+                .take(65537)
+                .read_to_end(&mut bytes)?;
+            ensure!(bytes.len() <= 65536, "fact-context request exceeds bound");
+            let request: aurelius_lanes::fact_context::ContextRequest =
+                serde_json::from_slice(&bytes)?;
+            request.validate()?;
+            ensure!(
+                config
+                    .lanes
+                    .values()
+                    .any(|lane| lane.scope == request.organization_id),
+                "fact-context organization is not configured"
+            );
+            let settings = config
+                .fact_context
+                .as_ref()
+                .context("fact-context configuration required")?;
+            let sink = aurelius_lanes::postgres::PostgresSink::connect(
+                config
+                    .postgres
+                    .clone()
+                    .context("Postgres configuration required")?,
+                config
+                    .embedding
+                    .as_ref()
+                    .context("embedding configuration required")?
+                    .dimensions,
+            )
+            .await?;
+            println!(
+                "{}",
+                sink.fact_context(settings, &request)
+                    .await?
+                    .canonical_prefix()?
+            );
+        }
+        "worker" => {
+            #[cfg(feature = "temporal")]
+            aurelius_lanes::temporal::run_worker(&config).await?;
+            #[cfg(not(feature = "temporal"))]
+            bail!("worker requires temporal build feature");
+        }
+        #[cfg(all(feature = "temporal", feature = "postgres"))]
+        "start-lanes"
+        | "notify-lanes"
+        | "status-lanes"
+        | "status-legacy-lanes"
+        | "schedule-lanes" => {
+            let temporal = config
+                .temporal
+                .as_ref()
+                .context("Temporal configuration required")?;
+            let client = aurelius_lanes::temporal::connect(temporal).await?;
+            if args[0] == "schedule-lanes" {
+                let id = aurelius_lanes::temporal_ready::create_schedule(&client, &config).await?;
+                println!("schedule={id} interval=6h paused_pending_cutover");
+                return Ok(());
+            }
+            for name in config.lanes.keys() {
+                let request = IngestRequest {
+                    lane: config.lane_request(name)?,
+                    after: None,
+                };
+                let id = aurelius_lanes::temporal_ready::workflow_id(
+                    &config.lanes[name].scope,
+                    &request,
+                );
+                if matches!(args[0].as_str(), "start-lanes" | "notify-lanes") {
+                    aurelius_lanes::temporal_ready::wake(&client, &config, request).await?;
+                    println!("lane={name} workflow={id} notified");
+                } else {
+                    let (id, status) = if args[0] == "status-legacy-lanes" {
+                        let legacy = format!(
+                            "aurelius-pg/{}/{}/{}",
+                            config.lanes[name].scope, name, request.lane.profile
+                        );
+                        let status =
+                            aurelius_lanes::temporal_ingest::status(&client, &legacy).await?;
+                        (legacy, status)
+                    } else {
+                        let status = aurelius_lanes::temporal_ready::status(&client, &id).await?;
+                        (id, status)
+                    };
+                    println!(
+                        "{}",
+                        serde_json::json!({"lane":name,"workflow":id,"status":status})
+                    );
+                }
+            }
+        }
+        #[cfg(feature = "postgres")]
+        "index-lanes" | "watch-lanes" => {
+            let mut engine = PgIngestor::new(config.clone()).await?;
+            let mut requests = config
+                .lanes
+                .keys()
+                .map(|name| Ok((name.clone(), engine.request(name)?)))
+                .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+            let mut timer = tokio::time::interval(std::time::Duration::from_secs(300));
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                timer.tick().await;
+                let mut failed = false;
+                for name in config.lanes.keys() {
+                    let request = requests.get(name).context("lane cursor missing")?.clone();
+                    match ingest_once(&mut engine, request).await {
+                        Ok(Some(receipt)) => {
+                            requests.insert(
+                                name.clone(),
+                                IngestRequest {
+                                    lane: receipt.epoch.request.lane.clone(),
+                                    after: Some(receipt.epoch.sequence),
+                                },
+                            );
+                            tracing::info!(lane=%name,indexed=receipt.indexed,deferred=receipt.deferred,ignored=receipt.ignored,"lane epoch stored in Postgres")
+                        }
+                        Ok(None) => {
+                            tracing::info!(lane=%name,"lane waiting for successful source epoch")
+                        }
+                        Err(LaneError::Invalid(_)) | Err(LaneError::Activity(_)) => {
+                            failed = true;
+                            tracing::error!(lane=%name,"lane processing failed; source details withheld");
+                        }
+                    }
+                }
+                if args[0] == "index-lanes" {
+                    ensure!(!failed, "some lanes failed; inspect operator metrics");
+                    break;
+                }
+            }
+        }
+        "extract" => {
+            let settings = config.chat.context("chat configuration required")?;
+            let mut extractor = ChatExtractor::new(&settings, config.ontology)?;
+            let mut input = tokio::io::BufReader::new(tokio::io::stdin());
+            loop {
+                let mut line = String::new();
+                let read = (&mut input)
+                    .take(2 * 1024 * 1024 + 1)
+                    .read_line(&mut line)
                     .await?;
-                Ok(())
-            })
-        })
-        .connect(&std::env::var("DATABASE_URL")?)
-        .await?;
-    let version: i32 = sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
-        .fetch_one(&pool)
-        .await?;
-    ensure!(version >= 180000, "PG18 required; refusing legacy database");
-    if mode == "migrate" {
-        MIGRATIONS.run(&pool).await?;
-        return Ok(());
-    }
-    let config = Config::load(std::path::Path::new(&std::env::var("LANES_CONFIG")?))?;
-    let store = Store { pool };
-    store.configure_lanes(&config).await?;
-    if mode == "replay" {
-        let lane = config.lane(args.get(1).context("usage: replay <lane> <sync-id>")?)?;
-        let id = args.get(2).context("sync ID required")?.parse()?;
-        store.enqueue(lane, id, true).await?;
-        tracing::info!(lane=%lane.name,sync_id=id,"operator archive replay queued");
-        return Ok(());
-    }
-    ensure!(
-        matches!(mode, "serve" | "worker"),
-        "expected serve, worker, migrate, or replay"
-    );
-    let worker = Worker::new(
-        config,
-        store,
-        if mode == "serve" {
-            Some(Airbyte::from_env()?)
-        } else {
-            None
-        },
-    )?;
-    if mode == "worker" {
-        loop {
-            tokio::select! {_=shutdown()=>break,result=worker.index_next()=>{match result{Ok(true)=>{},Ok(false)=>tokio::time::sleep(Duration::from_secs(2)).await,Err(_)=>{tracing::error!(code="worker_failed");tokio::time::sleep(Duration::from_secs(5)).await;}}}}
-        }
-        return Ok(());
-    }
-    let operator_token = std::env::var("OPERATOR_TOKEN")?;
-    let webhook_token = std::env::var("WEBHOOK_TOKEN")?;
-    let webhook_org = std::env::var("WEBHOOK_ORGANIZATION")?;
-    ensure!(
-        operator_token.len() >= 32 && webhook_token.len() >= 32,
-        "authentication secrets must be at least 32 characters"
-    );
-    let app = Arc::new(App {
-        worker,
-        operator_token,
-        webhook_token,
-        webhook_org,
-    });
-    ensure!(
-        registered(&app, &app.webhook_org),
-        "webhook organization must have a registered lane"
-    );
-    let dispatcher = Arc::clone(&app);
-    let dispatch = tokio::spawn(async move {
-        let mut daily = tokio::time::interval(Duration::from_secs(300));
-        loop {
-            tokio::select! {
-                _=daily.tick()=>{if dispatcher.worker.request_daily().await.is_err(){tracing::error!(code="daily_reconcile_failed");}},
-                _=tokio::time::sleep(Duration::from_secs(2))=>{
-                    if dispatcher.worker.reconcile_next().await.is_err(){tracing::error!(code="reconcile_dispatch_failed");}
-                    if dispatcher.worker.discover_next().await.is_err(){tracing::error!(code="manifest_dispatch_failed");}
+                if read == 0 {
+                    break;
                 }
+                ensure!(
+                    line.len() <= 2 * 1024 * 1024,
+                    "extraction input exceeds bound"
+                );
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let request: ExtractionRequest =
+                    serde_json::from_str(&line).context("invalid extraction request")?;
+                println!(
+                    "{}",
+                    serde_json::to_string(&extract_document(&mut extractor, request).await?)?
+                );
             }
         }
-    });
-    let indexer = app.worker.clone();
-    let indexing = tokio::spawn(async move {
-        loop {
-            match indexer.index_next().await {
-                Ok(true) => {}
-                Ok(false) => tokio::time::sleep(Duration::from_secs(2)).await,
-                Err(_) => {
-                    tracing::error!(code = "index_dispatch_failed");
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                }
-            }
-        }
-    });
-    let router = Router::new()
-        .route("/health", get(health))
-        .route("/webhooks/airbyte/{token}", post(webhook))
-        .route("/reconcile", post(reconcile))
-        .route("/search", post(search))
-        .layer(DefaultBodyLimit::max(16384))
-        .with_state(app);
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8090").await?;
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown())
-        .await?;
-    dispatch.abort();
-    indexing.abort();
+        _ => bail!("unknown worker command"),
+    }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn secret_comparison() {
-        assert!(same_secret("same", "same"));
-        assert!(!same_secret("same", "different"));
-    }
 }
