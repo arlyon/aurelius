@@ -117,12 +117,16 @@ pub struct SpanCatalog {
     clause_refs: std::collections::BTreeSet<String>,
     record_ref: Option<String>,
     business_start: usize,
+    evidence_refs: std::collections::BTreeSet<String>,
 }
 impl SpanCatalog {
     pub fn resolve(&self, href: &str) -> Result<&crate::contracts::SourceSpan> {
         self.spans
             .get(href)
             .ok_or_else(|| anyhow::anyhow!("unissued evidence marker"))
+    }
+    pub fn evidence_hrefs(&self) -> Vec<String> {
+        self.evidence_refs.iter().cloned().collect()
     }
     pub fn hrefs(&self) -> Vec<String> {
         self.spans.keys().cloned().collect()
@@ -268,6 +272,8 @@ impl PreparedFactSource {
             .map(|(href, _)| href.clone())
             .collect();
         let record_ref = root_range.map(|r| format!("span:{}-{}", r.start, r.end));
+        let mut evidence_refs = clause_refs.clone();
+        evidence_refs.insert(format!("span:{}-{}", chunk.range.start, chunk.range.end));
         Ok(SpanCatalog {
             document: chunk.document.key.clone(),
             content_hash: self.content_hash.clone(),
@@ -278,6 +284,7 @@ impl PreparedFactSource {
             clause_refs,
             record_ref,
             business_start,
+            evidence_refs,
         })
     }
 }

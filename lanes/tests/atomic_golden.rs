@@ -360,3 +360,56 @@ fn rendering_inserts_values_once_and_never_interprets_label_slots() -> Result<()
     assert!(graph.assertions[0].rendered.contains("{object}"));
     Ok(())
 }
+#[test]
+fn paid_probe_regressions_are_constrained_during_native_generation() -> Result<()> {
+    let cases = cases()?;
+    let registry = registry()?;
+    let (c, p, mut body) = fixture(&cases[0])?;
+    let catalog = p.span_catalog(&c)?;
+    let schema = registry.schema(&catalog)?;
+    let variants = schema["properties"]["assertions"]["items"]["anyOf"]
+        .as_array()
+        .unwrap();
+    let deadline = variants
+        .iter()
+        .find(|v| v["properties"]["predicate"]["const"] == "pull_deadline")
+        .unwrap();
+    let pattern = deadline["properties"]["object"]["properties"]["local_time"]["pattern"]
+        .as_str()
+        .unwrap();
+    let time = regex::Regex::new(pattern)?;
+    assert!(time.is_match("16:00"));
+    assert!(!time.is_match("4pm"));
+    let money = variants
+        .iter()
+        .find(|v| v["properties"]["predicate"]["const"] == "monthly_budget")
+        .unwrap();
+    let decimal = regex::Regex::new(
+        money["properties"]["object"]["properties"]["amount"]["pattern"]
+            .as_str()
+            .unwrap(),
+    )?;
+    assert!(decimal.is_match("50000"));
+    assert!(!decimal.is_match("50,000"));
+    body["assertions"][0]["object"]["local_time"] = json!("4pm");
+    assert!(atomic::validate(&body.to_string(), &catalog, &registry).is_err());
+    for review in schema["properties"]["review_items"]["items"]["anyOf"]
+        .as_array()
+        .unwrap()
+    {
+        let props = &review["properties"];
+        let href = props["span_ref"]["const"].as_str().unwrap();
+        assert_eq!(props["exact_quote"]["const"], catalog.quote(href)?);
+    }
+    let (c, p, _) = fixture(
+        cases
+            .iter()
+            .find(|c| c["name"] == "complete_send_roles")
+            .unwrap(),
+    )?;
+    let catalog = p.span_catalog(&c)?;
+    let nora = href(&c.document.text, "Nora");
+    assert!(catalog.resolve(&nora).is_ok());
+    assert!(!catalog.evidence_hrefs().contains(&nora));
+    Ok(())
+}
