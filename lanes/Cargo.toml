@@ -27,6 +27,11 @@ path = "tests/fact_lab.rs"
 required-features = ["language"]
 
 [[example]]
+name = "weekend_facts"
+path = "examples/weekend_facts.rs"
+required-features = ["postgres", "language"]
+
+[[example]]
 name = "quality_pilot"
 path = "examples/quality_pilot.rs"
 required-features = ["postgres", "language"]

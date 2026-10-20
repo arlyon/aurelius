@@ -219,8 +219,13 @@ pub struct ChatExtractor {
     api: ChatApi,
     gateway: bool,
     references: crate::references::ReferenceConfig,
+    run_budget: Option<crate::run_budget::RunBudget>,
 }
 impl ChatExtractor {
+    pub fn with_run_budget(mut self, budget: crate::run_budget::RunBudget) -> Self {
+        self.run_budget = Some(budget);
+        self
+    }
     pub fn profile_for(settings: &ChatConfig, ontology: &Ontology) -> Result<String> {
         settings.validate()?;
         Ok(blake3::hash(&serde_json::to_vec(&(
@@ -286,6 +291,7 @@ impl ChatExtractor {
             api: settings.api,
             gateway: settings.gateway.is_some(),
             references: settings.references.clone(),
+            run_budget: None,
         })
     }
     pub async fn extract(&self, chunk: &Chunk) -> Result<CandidateGraph> {
@@ -425,6 +431,18 @@ impl ChatExtractor {
             request=request.header("cf-aig-metadata",serde_json::to_string(&json!({"org_id":chunk.document.key.scope,"workload":"fact-extraction","stage":"fact-extraction","model":self.model,"surface":"worker","execution_id":execution,"prompt_id":prompt_version,"profile":profile}))?)
                 .header("cf-aig-skip-cache","true").header("cf-aig-max-attempts","1").header("cf-aig-collect-log-payload","false");
         }
+        let permit = self
+            .run_budget
+            .as_ref()
+            .map(|budget| {
+                budget.reserve(
+                    serde_json::to_vec(&body)
+                        .map_err(anyhow::Error::from)?
+                        .len(),
+                    max_output_tokens,
+                )
+            })
+            .transpose()?;
         let mut response = request.send().await?;
         response.error_for_status_ref().map_err(|error| {
             anyhow::Error::new(error).context(format!(
@@ -461,6 +479,13 @@ impl ChatExtractor {
                 .or_else(|| usage.get("completion_tokens"))
                 .and_then(Value::as_u64),
         });
+        if let Some(permit) = permit {
+            let (input, output) = usage
+                .as_ref()
+                .and_then(|u| u.input_tokens.zip(u.output_tokens))
+                .context("provider usage missing; bounded run halted")?;
+            permit.settle(input, output)?;
+        }
         (|| ->Result<ModelOutput> {
         if let Some(usage) = response.get("usage") {
             tracing::info!(org_id=%chunk.document.key.scope,model=%self.model,profile=%profile,input_tokens=usage.get("input_tokens").or_else(||usage.get("prompt_tokens")).and_then(|v|v.as_u64()),cached_input_tokens=usage.pointer("/input_tokens_details/cached_tokens").or_else(||usage.pointer("/prompt_tokens_details/cached_tokens")).and_then(|v|v.as_u64()),output_tokens=usage.get("output_tokens").or_else(||usage.get("completion_tokens")).and_then(|v|v.as_u64()),"fact extraction usage");

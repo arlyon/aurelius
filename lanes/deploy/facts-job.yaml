@@ -1,0 +1,138 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ${RUN_ID}-budget
+  namespace: airbyte
+  labels:
+    app: knowledge-facts-canary
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: hcloud-volumes
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${RUN_ID}
+  namespace: airbyte
+  labels:
+    app: knowledge-facts-canary
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 259200
+  ttlSecondsAfterFinished: 604800
+  completions: 1
+  parallelism: 1
+  podFailurePolicy:
+    rules:
+      - action: FailJob
+        onPodConditions:
+          - type: DisruptionTarget
+            status: "True"
+      - action: FailJob
+        onExitCodes:
+          containerName: facts
+          operator: NotIn
+          values: [0]
+  template:
+    metadata:
+      labels:
+        app: knowledge-facts-canary
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/arch: amd64
+        kubernetes.io/hostname: theadspend-worker-3
+      imagePullSecrets:
+        - name: lake-registry
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: verify-neural-runtime
+          image: ${IMAGE}
+          command: [/app/fact_lab]
+          args: [replay, --config, /config/aurelius.toml, --input, /opt/smoke/input.jsonl, --responses, /opt/smoke/responses, --output, /tmp/neural-smoke, --fresh, --model-dir, /opt/models]
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1536Mi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      containers:
+        - name: facts
+          image: ${IMAGE}
+          args: [/config/aurelius.toml, "$(FACT_SCOPE)", /budget/requests.jsonl, "3000", "20000", "259200"]
+          envFrom:
+            - secretRef:
+                name: lake-upstream
+          env:
+            - name: FACT_SCOPE
+              valueFrom:
+                configMapKeyRef:
+                  name: ${RUN_ID}-config
+                  key: scope
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: lake-runtime
+                  key: DATABASE_URL
+            - name: CLOUDFLARE_AI_GATEWAY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: knowledge-lanes-ai
+                  key: CLOUDFLARE_AI_GATEWAY_TOKEN
+            - name: RUST_LOG
+              value: aurelius_lanes=info,weekend_facts=info
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1536Mi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: budget
+              mountPath: /budget
+      volumes:
+        - name: config
+          configMap:
+            name: ${RUN_ID}-config
+            defaultMode: 0444
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+        - name: budget
+          persistentVolumeClaim:
+            claimName: ${RUN_ID}-budget

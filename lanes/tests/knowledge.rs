@@ -48,6 +48,84 @@ fn claim() -> Value {
     json!({"subject":"Ada","predicate":"increase","object":"spend","statement_type":"constraint","polarity":"negative","modality":"must","qualifiers":{"adverbs":["usually"],"conditions":["during Q4"],"scope":"acquisition"},"valid_from":null,"valid_to":null,"quote":"Ada usually must not increase spend during Q4."})
 }
 
+#[tokio::test]
+async fn durable_budget_stops_transport_before_extra_calls_and_after_provider_failure()
+-> anyhow::Result<()> {
+    use aurelius_lanes::run_budget::{RunBudget, RunStopped};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let output=json!({"facts":[{"subject":"Ada","predicate":"manages","object":"Acme","quote":"Ada manages Acme.","statement_type":"observation","polarity":"positive","modality":"asserted","qualifiers":{"adverbs":[],"conditions":[],"scope":null},"valid_from":null,"valid_to":null}]}).to_string();
+    let router=axum::Router::new().route("/chat",axum::routing::post(move || {observed.fetch_add(1,Ordering::SeqCst);let output=output.clone();async move{axum::Json(json!({"choices":[{"finish_reason":"stop","message":{"content":output}}],"usage":{"prompt_tokens":10,"completion_tokens":10}}))}}));
+    let failures = Arc::new(AtomicUsize::new(0));
+    let observed = failures.clone();
+    let router = router.route(
+        "/failure",
+        axum::routing::post(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async { axum::http::StatusCode::BAD_GATEWAY }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, router).await });
+    let directory = std::env::temp_dir().join(format!(
+        "transport-budget-{}-{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap()
+    ));
+    std::fs::create_dir(&directory)?;
+    let budget = RunBudget::open(
+        &directory.join("calls.jsonl"),
+        "mock".into(),
+        100,
+        1,
+        std::time::Duration::from_secs(60),
+    )?;
+    let client = ChatExtractor::new(
+        &settings(&format!("http://{address}/chat")),
+        Config::parse(BUSINESS)?.ontology,
+    )?
+    .with_run_budget(budget.clone());
+    client.extract(&chunk("Ada manages Acme.")).await?;
+    assert!(
+        client
+            .extract(&chunk("Ada manages Acme."))
+            .await
+            .err()
+            .unwrap()
+            .downcast_ref::<RunStopped>()
+            .is_some()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(budget.snapshot()?.charged_nano_usd, 6000);
+    let failed = RunBudget::open(
+        &directory.join("failed.jsonl"),
+        "mock-failure".into(),
+        100,
+        10,
+        std::time::Duration::from_secs(60),
+    )?;
+    let client = ChatExtractor::new(
+        &settings(&format!("http://{address}/failure")),
+        Config::parse(BUSINESS)?.ontology,
+    )?
+    .with_run_budget(failed.clone());
+    assert!(client.extract(&chunk("Ada manages Acme.")).await.is_err());
+    assert!(failed.check().is_err());
+    assert!(client.extract(&chunk("Ada manages Acme.")).await.is_err());
+    assert_eq!(failures.load(Ordering::SeqCst), 1);
+    assert!(failed.snapshot()?.charged_nano_usd > 6000);
+    server.abort();
+    drop(client);
+    drop(budget);
+    drop(failed);
+    std::fs::remove_dir_all(directory)?;
+    Ok(())
+}
 #[test]
 fn ontology_profiles_are_generic_and_semantically_hashed() {
     let business = Config::parse(BUSINESS).unwrap();

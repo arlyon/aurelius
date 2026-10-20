@@ -22,6 +22,7 @@ pub mod provider_metadata;
 pub mod quality;
 pub mod reduction;
 pub mod references;
+pub mod run_budget;
 pub mod source;
 pub mod storage;
 pub mod time_value;

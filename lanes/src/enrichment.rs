@@ -157,6 +157,10 @@ mod runtime {
             .await?;
             Self::with_sink(config, sink)
         }
+        pub fn with_run_budget(mut self, budget: crate::run_budget::RunBudget) -> Self {
+            self.extractor = self.extractor.with_run_budget(budget);
+            self
+        }
         pub fn with_sink(config: Config, sink: PostgresSink) -> Result<Self> {
             Self::with_reader(config, sink, None)
         }
