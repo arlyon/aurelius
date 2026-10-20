@@ -432,3 +432,32 @@ fn noun_like_action_headings_are_not_named_entity_anchors() -> Result<()> {
     );
     Ok(())
 }
+#[test]
+fn native_review_identifiers_and_money_punctuation_match_the_contract() -> Result<()> {
+    let registry = registry()?;
+    for (quote, amount) in [
+        ("Monthly budget $1,500, with KPIs.", "1500"),
+        ("Monthly budget $5,000.", "5000"),
+    ] {
+        let case = json!({"source":format!("Budget plan\n{quote}"),"entities":[["b","budget_plan","Budget plan",null]],"facts":[{"subject":"b","predicate":"monthly_budget","object":{"kind":"money","amount":amount,"currency_symbol":"$","period":"month"},"mode":"asserted","quote":quote}]});
+        let (c, p, body) = fixture(&case)?;
+        let catalog = p.span_catalog(&c)?;
+        let graph = atomic::validate(&body.to_string(), &catalog, &registry)?;
+        assert_eq!(graph.assertions.len(), 1);
+        let schema = registry.schema(&catalog)?;
+        let review = &schema["properties"]["review_items"]["items"]["anyOf"][0]["properties"];
+        let identifier =
+            regex::Regex::new(review["intended_predicate"]["pattern"].as_str().unwrap())?;
+        assert!(identifier.is_match("requested_push_action"));
+        assert!(!identifier.is_match("requested push action"));
+    }
+    let case = json!({"source":"HubSpot tracking\nHubSpot events don’t have UTMs.","entities":[["t","tracking_configuration","HubSpot tracking",null]],"facts":[{"subject":"t","predicate":"operational_status","object":{"kind":"code","value":"missing"},"mode":"asserted","quote":"HubSpot events don’t have UTMs."}]});
+    let (c, p, body) = fixture(&case)?;
+    assert_eq!(
+        atomic::validate(&body.to_string(), &p.span_catalog(&c)?, &registry)?
+            .assertions
+            .len(),
+        1
+    );
+    Ok(())
+}
