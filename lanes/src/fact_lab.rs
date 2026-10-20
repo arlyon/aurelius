@@ -104,7 +104,7 @@ fn safe_id(id: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
 }
-fn bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
+pub(crate) fn bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     File::open(path)?.take(limit + 1).read_to_end(&mut bytes)?;
     ensure!(bytes.len() as u64 <= limit, "lab file exceeds byte budget");
@@ -258,7 +258,7 @@ pub fn units_bounded(
     }
     Ok(merged)
 }
-fn private_json(path: &Path, value: &impl Serialize) -> Result<()> {
+pub(crate) fn private_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -298,15 +298,29 @@ impl Ledger {
         Ok(())
     }
 }
-struct Preparation<'a> {
+pub(crate) struct Preparation<'a> {
     config: &'a Config,
     runtime: Option<Arc<LanguageRuntime>>,
     language: BTreeMap<String, LanguageAnalysis>,
     fresh: bool,
     language_profile: String,
 }
-impl Preparation<'_> {
-    async fn prepare(&mut self, record: &LabRecord) -> Result<PreparedFactSource> {
+impl<'a> Preparation<'a> {
+    pub(crate) fn new(config: &'a Config, fresh: bool) -> Result<Self> {
+        Ok(Self {
+            config,
+            fresh,
+            runtime: None,
+            language: BTreeMap::new(),
+            language_profile: LanguageRuntime::profile_for(
+                config
+                    .language
+                    .as_ref()
+                    .context("language config required")?,
+            )?,
+        })
+    }
+    pub(crate) async fn prepare(&mut self, record: &LabRecord) -> Result<PreparedFactSource> {
         let policy = self
             .config
             .fact_quality

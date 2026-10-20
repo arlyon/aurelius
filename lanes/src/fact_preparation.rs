@@ -105,6 +105,182 @@ impl PreparedFactSource {
         Ok(prefix)
     }
 }
+/// Request-local evidence catalog. Generated links never alter source coordinates.
+#[derive(Clone, Debug, Serialize)]
+pub struct SpanCatalog {
+    pub document: DocumentKey,
+    pub content_hash: String,
+    pub links: Vec<String>,
+    spans: BTreeMap<String, crate::contracts::SourceSpan>,
+    noun_refs: std::collections::BTreeSet<String>,
+    action_refs: std::collections::BTreeSet<String>,
+    clause_refs: std::collections::BTreeSet<String>,
+    record_ref: Option<String>,
+    business_start: usize,
+}
+impl SpanCatalog {
+    pub fn resolve(&self, href: &str) -> Result<&crate::contracts::SourceSpan> {
+        self.spans
+            .get(href)
+            .ok_or_else(|| anyhow::anyhow!("unissued evidence marker"))
+    }
+    pub fn hrefs(&self) -> Vec<String> {
+        self.spans.keys().cloned().collect()
+    }
+    pub fn quote(&self, href: &str) -> Result<&str> {
+        Ok(&self.resolve(href)?.quote)
+    }
+    pub fn anchor_hrefs(&self, kind: &crate::atomic::AnchorKind) -> Vec<String> {
+        match kind {
+            crate::atomic::AnchorKind::Mention => self.noun_refs.iter().cloned().collect(),
+            crate::atomic::AnchorKind::Action => self.action_refs.iter().cloned().collect(),
+            crate::atomic::AnchorKind::Facet => {
+                self.clause_refs.union(&self.noun_refs).cloned().collect()
+            }
+            crate::atomic::AnchorKind::Record => self.record_ref.iter().cloned().collect(),
+        }
+    }
+    pub fn record_anchor(&self) -> Result<&crate::contracts::SourceSpan> {
+        self.resolve(
+            self.record_ref
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("source record anchor absent"))?,
+        )
+    }
+    pub fn business_quote(&self, href: &str) -> Result<&str> {
+        let span = self.resolve(href)?;
+        if span.range.end <= self.business_start {
+            return Ok("");
+        }
+        Ok(&span.quote[self.business_start.saturating_sub(span.range.start)..])
+    }
+}
+impl PreparedFactSource {
+    pub fn span_catalog(&self, chunk: &crate::contracts::Chunk) -> Result<SpanCatalog> {
+        chunk.text()?;
+        ensure!(
+            self.document == chunk.document.key
+                && self.content_hash == chunk.document.content_hash(),
+            "span catalog source changed"
+        );
+        self.language.validate(&chunk.document)?;
+        let mut ranges = std::collections::BTreeSet::new();
+        let business_start = self.provider_header.as_ref().map_or(0, |h| h.text.len());
+        let mut clause_refs = std::collections::BTreeSet::new();
+        let root_range = if let Some(h) = &self.provider_header {
+            Some(h.title)
+        } else {
+            let mut offset = 0;
+            let mut found = None;
+            for line in chunk.document.text.split_inclusive('\n') {
+                let leading = line.len() - line.trim_start().len();
+                let end = line.trim_end().len();
+                if end > leading {
+                    found = Some(ByteRange {
+                        start: offset + leading,
+                        end: offset + end,
+                    });
+                    break;
+                }
+                offset += line.len();
+            }
+            found
+        };
+        if let Some(r) = root_range {
+            ranges.insert((r.start, r.end));
+        }
+        ranges.insert((chunk.range.start, chunk.range.end));
+        let mut offset = chunk.range.start;
+        for line in chunk.text()?.split_inclusive('\n') {
+            let leading = line.len() - line.trim_start().len();
+            let end = line.trim_end().len();
+            if end > leading {
+                ranges.insert((offset + leading, offset + end));
+                if offset + leading >= business_start {
+                    clause_refs.insert(format!("span:{}-{}", offset + leading, offset + end));
+                }
+            }
+            offset += line.len();
+        }
+        for m in &self.language.mentions {
+            if m.range.start >= chunk.range.start && m.range.end <= chunk.range.end {
+                ranges.insert((m.range.start, m.range.end));
+            }
+        }
+        for r in self
+            .language
+            .verb_spans
+            .iter()
+            .chain(self.language.number_spans.iter())
+        {
+            if r.start >= chunk.range.start && r.end <= chunk.range.end {
+                ranges.insert((r.start, r.end));
+            }
+        }
+        if let Some(header) = &self.provider_header {
+            header.validate(&chunk.document)?;
+            ranges.insert((header.title.start, header.title.end));
+        }
+        ensure!(ranges.len() <= 2048, "span catalog exceeds bound");
+        let mut spans = BTreeMap::new();
+        let mut links = Vec::new();
+        for (start, end) in ranges {
+            let range = ByteRange { start, end };
+            let quote = range.text(&chunk.document)?.to_owned();
+            let href = format!("span:{start}-{end}");
+            let label = quote
+                .replace('\\', "\\\\")
+                .replace('[', "\\[")
+                .replace(']', "\\]");
+            links.push(format!("[{label}]({href})"));
+            spans.insert(
+                href,
+                crate::contracts::SourceSpan {
+                    document: chunk.document.key.clone(),
+                    content_hash: self.content_hash.clone(),
+                    range,
+                    quote,
+                },
+            );
+        }
+        ensure!(
+            serde_json::to_vec(&links)?.len() <= 128 * 1024,
+            "annotated source exceeds bound"
+        );
+        let noun_refs = self
+            .language
+            .mentions
+            .iter()
+            .filter(|m| m.noun && !m.pronoun)
+            .map(|m| format!("span:{}-{}", m.range.start, m.range.end))
+            .filter(|href| spans.contains_key(href))
+            .collect();
+        let action_refs = spans
+            .iter()
+            .filter(|(_, span)| {
+                span.range.start >= business_start
+                    && self
+                        .language
+                        .verb_spans
+                        .iter()
+                        .any(|r| r.start >= span.range.start && r.end <= span.range.end)
+            })
+            .map(|(href, _)| href.clone())
+            .collect();
+        let record_ref = root_range.map(|r| format!("span:{}-{}", r.start, r.end));
+        Ok(SpanCatalog {
+            document: chunk.document.key.clone(),
+            content_hash: self.content_hash.clone(),
+            links,
+            spans,
+            noun_refs,
+            action_refs,
+            clause_refs,
+            record_ref,
+            business_start,
+        })
+    }
+}
 // Matching a trusted alias dictionary only proposes retrieval candidates. Neither
 // a unique spelling nor a neural coreference cluster proves an entity identity.
 pub fn alias_hypotheses(

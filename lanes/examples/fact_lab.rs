@@ -9,7 +9,7 @@ async fn execute() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.is_empty() || args[0] == "--help" {
         println!(
-            "fact_lab replay --config FILE --input FILE --responses DIR --output NEW_DIR [--records 9,62] [--fresh]\nfact_lab run --live --max-calls N --config FILE --input FILE --output NEW_DIR [--records 9,62] [--fresh] [--batch-adjacent] [--batch-bytes N] [--instructions FILE] [--expected FILE] [--model-dir DIR]\nfact_lab compare --before DIR --after DIR\nCached preparation is the default; use --fresh for new records/model settings. Source/proposals/rejections are private local artifacts; no production writes."
+            "fact_lab replay --config FILE --input FILE --responses DIR --output NEW_DIR [--records 9,62] [--fresh]\nfact_lab run --live --max-calls N --config FILE --input FILE --output NEW_DIR [--records 9,62] [--fresh] [--batch-adjacent] [--batch-bytes N] [--instructions FILE] [--expected FILE] [--model-dir DIR]\nfact_lab compare --before DIR --after DIR\nAtomic mode: add --atomic-registry examples/atomic_spo.json; live additionally requires --max-cents N, --max-calls N (optional --deadline-seconds N, --max-output-tokens N). Replay requires request-bound response artifacts; old v11 artifacts are rejected. No atomic adjacent batching.\nCached preparation is the default; use --fresh for new records/model settings. Source/proposals/rejections are private local artifacts; no production writes."
         );
         return Ok(());
     }
@@ -39,6 +39,10 @@ async fn execute() -> Result<()> {
                         | "--expected"
                         | "--model-dir"
                         | "--batch-bytes"
+                        | "--atomic-registry"
+                        | "--max-cents"
+                        | "--deadline-seconds"
+                        | "--max-output-tokens"
                 ),
                 "unknown option"
             );
@@ -154,7 +158,52 @@ async fn execute() -> Result<()> {
     } else {
         None
     };
-    let summary = fact_lab::run(&config, &records, &options).await?;
+    let summary = if let Some(path) = values.get("--atomic-registry") {
+        ensure!(
+            !values.contains_key("--instructions"),
+            "atomic instructions come from the predicate registry, not the legacy prompt"
+        );
+        let registry = aurelius_lanes::atomic_lab::load_registry(std::path::Path::new(path))?;
+        let summary = aurelius_lanes::atomic_lab::run(
+            &config,
+            &records,
+            &registry,
+            &options,
+            aurelius_lanes::atomic_lab::Limits {
+                max_cents: values
+                    .get("--max-cents")
+                    .map(|v| v.parse())
+                    .transpose()?
+                    .unwrap_or_default(),
+                seconds: values
+                    .get("--deadline-seconds")
+                    .map(|v| v.parse())
+                    .transpose()?
+                    .unwrap_or(600),
+                max_output_tokens: values
+                    .get("--max-output-tokens")
+                    .map(|v| v.parse())
+                    .transpose()?
+                    .unwrap_or(8192),
+            },
+        )
+        .await?;
+        let failed = summary.failed_records > 0 || summary.not_run > 0;
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+        ensure!(
+            !failed,
+            "atomic run incomplete; inspect private diagnostics"
+        );
+        serde_json::to_value(summary)?
+    } else {
+        ensure!(
+            !values.contains_key("--max-cents")
+                && !values.contains_key("--deadline-seconds")
+                && !values.contains_key("--max-output-tokens"),
+            "atomic limits require --atomic-registry"
+        );
+        serde_json::to_value(fact_lab::run(&config, &records, &options).await?)?
+    };
     if let Some(expected) = expectations {
         use std::{io::Write, os::unix::fs::OpenOptionsExt};
         let mut file = std::fs::OpenOptions::new()

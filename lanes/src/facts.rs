@@ -141,6 +141,8 @@ pub enum ReviewDiagnostic {
     UnclassifiedValidation,
     ReplayUnavailable,
     InputBudget,
+    NativeSchemaUnsupported,
+    NativeSchemaViolation,
 }
 impl std::fmt::Display for ReviewDiagnostic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -200,6 +202,15 @@ pub struct QualityExtraction {
     pub graph: crate::quality::QualityGraph,
     pub usage: Option<ExtractionUsage>,
 }
+#[derive(Serialize)]
+pub struct AtomicExtraction {
+    pub binding: String,
+    pub graph: crate::atomic::AtomicGraph,
+    pub usage: Option<ExtractionUsage>,
+    #[serde(skip_serializing)]
+    pub raw_output: String,
+    pub profile: String,
+}
 pub fn review_diagnostic(error: &anyhow::Error) -> ReviewDiagnostic {
     error
         .downcast_ref::<ReviewDiagnostic>()
@@ -214,6 +225,7 @@ pub struct ChatExtractor {
     model: String,
     ontology: Ontology,
     pub profile: String,
+    atomic_profile: String,
     ontology_hash: String,
     prompt: String,
     api: ChatApi,
@@ -240,6 +252,16 @@ impl ChatExtractor {
         .to_hex()
         .to_string())
     }
+    pub fn atomic_profile_for(settings: &ChatConfig, ontology: &Ontology) -> Result<String> {
+        Ok(blake3::hash(&serde_json::to_vec(&(
+            crate::atomic::VERSION,
+            Self::profile_for(settings, ontology)?,
+            &settings.endpoint,
+            &settings.gateway,
+        ))?)
+        .to_hex()
+        .to_string())
+    }
     pub fn new(settings: &ChatConfig, ontology: Ontology) -> Result<Self> {
         Self::with_credentials(settings, ontology, crate::config::credential)
     }
@@ -251,6 +273,7 @@ impl ChatExtractor {
         let endpoint = settings.validate()?;
         let ontology_hash = ontology.semantic_hash()?;
         let profile = Self::profile_for(settings, &ontology)?;
+        let atomic_profile = Self::atomic_profile_for(settings, &ontology)?;
         let prompt = format!(
             "{PROMPT}\nThe user JSON contains source_text and deterministic reference_hints. Hints are source-local hypotheses, not accepted identity merges or additional evidence. Keep quotes and argument mentions verbatim in source_text. Do not perform additional coreference inference: without an explicit hint, retain the mention's verbatim form, including unresolved pronouns.\nConfigured ontology:\n{}",
             serde_json::to_string(&ontology)?
@@ -292,6 +315,7 @@ impl ChatExtractor {
             gateway: settings.gateway.is_some(),
             references: settings.references.clone(),
             run_budget: None,
+            atomic_profile,
         })
     }
     pub async fn extract(&self, chunk: &Chunk) -> Result<CandidateGraph> {
@@ -398,6 +422,52 @@ impl ChatExtractor {
             usage: content.usage,
         })
     }
+    pub async fn extract_atomic(
+        &self,
+        chunk: &Chunk,
+        prepared: &crate::fact_preparation::PreparedFactSource,
+        registry: &crate::atomic::Registry,
+        max_output_tokens: u32,
+    ) -> Result<AtomicExtraction> {
+        ensure!(
+            matches!(self.api, ChatApi::Responses),
+            ReviewDiagnostic::NativeSchemaUnsupported
+        );
+        let request = crate::atomic::prepare_request(
+            chunk,
+            prepared,
+            registry,
+            &self.atomic_profile,
+            max_output_tokens,
+        )?;
+        let format = json!({"type":"json_schema","name":"atomic_spo_v1","strict":true,"schema":request.schema});
+        let output = self
+            .complete_formatted(
+                chunk,
+                &request.prompt,
+                &request.input,
+                (&request.profile, crate::atomic::VERSION, max_output_tokens),
+                Some(&format),
+            )
+            .await?;
+        let graph =
+            crate::atomic::validate(&output.text, &request.catalog, registry).map_err(|error| {
+                with_usage(
+                    self.with_output(
+                        error.context(ReviewDiagnostic::NativeSchemaViolation),
+                        &output.text,
+                    ),
+                    output.usage.as_ref(),
+                )
+            })?;
+        Ok(AtomicExtraction {
+            graph,
+            usage: output.usage,
+            raw_output: output.text,
+            profile: request.profile,
+            binding: request.binding,
+        })
+    }
     async fn complete(
         &self,
         chunk: &Chunk,
@@ -407,6 +477,24 @@ impl ChatExtractor {
         prompt_version: &str,
         max_output_tokens: u32,
     ) -> Result<ModelOutput> {
+        self.complete_formatted(
+            chunk,
+            prompt,
+            input,
+            (profile, prompt_version, max_output_tokens),
+            None,
+        )
+        .await
+    }
+    async fn complete_formatted(
+        &self,
+        chunk: &Chunk,
+        prompt: &str,
+        input: &str,
+        settings: (&str, &str, u32),
+        format: Option<&Value>,
+    ) -> Result<ModelOutput> {
+        let (profile, prompt_version, max_output_tokens) = settings;
         validate_model_input(prompt)
             .and_then(|()| validate_model_input(input))
             .context(ExtractionReview::Input)?;
@@ -415,7 +503,7 @@ impl ChatExtractor {
                 json!({"model":self.model,"temperature":0,"max_tokens":max_output_tokens,"messages":[{"role":"system","content":prompt},{"role":"user","content":input}]})
             }
             ChatApi::Responses => {
-                json!({"model":self.model,"max_output_tokens":max_output_tokens,"store":false,"text":{"format":{"type":"json_object"}},"input":[{"role":"system","content":prompt},{"role":"user","content":input}]})
+                json!({"model":self.model,"max_output_tokens":max_output_tokens,"store":false,"text":{"format":format.cloned().unwrap_or_else(||json!({"type":"json_object"}))},"input":[{"role":"system","content":prompt},{"role":"user","content":input}]})
             }
         };
         let mut request = self.client.post(self.endpoint.clone()).json(&body);
@@ -444,6 +532,14 @@ impl ChatExtractor {
             })
             .transpose()?;
         let mut response = request.send().await?;
+        if format.is_some() && matches!(response.status().as_u16(), 400 | 422) {
+            return Err(
+                anyhow::Error::new(ReviewDiagnostic::NativeSchemaUnsupported).context(format!(
+                    "native schema request rejected (HTTP {})",
+                    response.status().as_u16()
+                )),
+            );
+        }
         response.error_for_status_ref().map_err(|error| {
             anyhow::Error::new(error).context(format!(
                 "fact extraction request failed (HTTP {})",

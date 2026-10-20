@@ -1,3 +1,6 @@
+pub mod atomic;
+#[cfg(feature = "language")]
+pub mod atomic_lab;
 pub mod config;
 pub mod contracts;
 pub mod document;
