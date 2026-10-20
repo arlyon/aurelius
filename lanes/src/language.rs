@@ -2,7 +2,7 @@ use crate::contracts::{ByteRange, Document, DocumentKey};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
-pub const LANGUAGE_VERSION: &str = "source-aligned-fcoref-v2";
+pub const LANGUAGE_VERSION: &str = "source-aligned-fcoref-v3";
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LanguageConfig {
@@ -49,6 +49,8 @@ pub struct LanguageAnalysis {
     pub coreference_hypotheses: Vec<Vec<String>>,
     pub verb_spans: Vec<ByteRange>,
     pub number_spans: Vec<ByteRange>,
+    #[serde(default)]
+    pub sentence_spans: Vec<ByteRange>,
 }
 impl LanguageAnalysis {
     pub fn validate(&self, document: &Document) -> Result<()> {
@@ -83,7 +85,12 @@ impl LanguageAnalysis {
                 "duplicate coreference mention"
             );
         }
-        for range in self.verb_spans.iter().chain(&self.number_spans) {
+        for range in self
+            .verb_spans
+            .iter()
+            .chain(&self.number_spans)
+            .chain(&self.sentence_spans)
+        {
             range.text(document)?;
         }
         Ok(())
@@ -199,8 +206,11 @@ mod runtime {
             let mut words = Vec::new();
             let mut verbs = Vec::new();
             let mut numbers = Vec::new();
+            let mut sentences = Vec::new();
             for sentence in self.nlp.pipe(&document.text) {
                 let mut phrase = None;
+                let mut sentence_start = None;
+                let mut sentence_end = 0;
                 for token in sentence.tokens() {
                     let range = token.span().byte();
                     if range.is_empty() {
@@ -214,6 +224,8 @@ mod runtime {
                         span.text(document)? == token.word().text().as_str(),
                         "word segmentation rewrote source text"
                     );
+                    sentence_start.get_or_insert(span.start);
+                    sentence_end = span.end;
                     words.push((span.start, span.end));
                     ensure!(
                         words.len() <= self.config.max_document_tokens,
@@ -282,6 +294,12 @@ mod runtime {
                             raw_mention_score: None,
                         });
                     }
+                }
+                if let Some(start) = sentence_start {
+                    sentences.push(ByteRange {
+                        start,
+                        end: sentence_end,
+                    });
                 }
             }
             let surfaces: Vec<_> = words
@@ -356,6 +374,7 @@ mod runtime {
                 coreference_hypotheses: clusters,
                 verb_spans: verbs,
                 number_spans: numbers,
+                sentence_spans: sentences,
             };
             result.validate(document)?;
             Ok(result)

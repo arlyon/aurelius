@@ -105,6 +105,12 @@ impl PreparedFactSource {
         Ok(prefix)
     }
 }
+#[derive(Clone, Debug, Serialize)]
+pub struct AttributionHypothesis {
+    pub evidence_ref: String,
+    pub reporter_ref: String,
+    pub verb_ref: String,
+}
 /// Request-local evidence catalog. Generated links never alter source coordinates.
 #[derive(Clone, Debug, Serialize)]
 pub struct SpanCatalog {
@@ -118,6 +124,10 @@ pub struct SpanCatalog {
     record_ref: Option<String>,
     business_start: usize,
     evidence_refs: std::collections::BTreeSet<String>,
+    pub attribution_hypotheses: Vec<AttributionHypothesis>,
+    instruction_title_ref: Option<String>,
+    reporting_units: std::collections::BTreeSet<String>,
+    sentence_refs: std::collections::BTreeSet<String>,
 }
 impl SpanCatalog {
     pub fn resolve(&self, href: &str) -> Result<&crate::contracts::SourceSpan> {
@@ -127,6 +137,36 @@ impl SpanCatalog {
     }
     pub fn evidence_hrefs(&self) -> Vec<String> {
         self.evidence_refs.iter().cloned().collect()
+    }
+    pub fn ambiguous_attribution_unit(&self, evidence: &[String]) -> bool {
+        evidence.iter().any(|r| {
+            self.reporting_units.contains(r)
+                && self.spans.get(r).is_some_and(|unit| {
+                    self.sentence_refs
+                        .iter()
+                        .filter(|s| {
+                            let span = &self.spans[*s];
+                            span.range.start >= unit.range.start && span.range.end <= unit.range.end
+                        })
+                        .count()
+                        > 1
+                })
+        })
+    }
+    pub fn requires_attribution(&self, evidence: &[String]) -> bool {
+        evidence.iter().any(|r| self.reporting_units.contains(r))
+    }
+    pub fn reporter_hrefs(&self, evidence: &[String]) -> Vec<String> {
+        self.attribution_hypotheses
+            .iter()
+            .filter(|h| evidence.contains(&h.evidence_ref))
+            .map(|h| h.reporter_ref.clone())
+            .collect()
+    }
+    pub fn is_instruction_title(&self, span: &crate::contracts::SourceSpan) -> bool {
+        self.instruction_title_ref
+            .as_ref()
+            .is_some_and(|r| self.spans.get(r).is_some_and(|s| s.range == span.range))
     }
     pub fn hrefs(&self) -> Vec<String> {
         self.spans.keys().cloned().collect()
@@ -211,6 +251,13 @@ impl PreparedFactSource {
                 ranges.insert((m.range.start, m.range.end));
             }
         }
+        let mut sentence_refs = std::collections::BTreeSet::new();
+        for s in &self.language.sentence_spans {
+            if s.start >= chunk.range.start && s.end <= chunk.range.end && s.end > business_start {
+                ranges.insert((s.start, s.end));
+                sentence_refs.insert(format!("span:{}-{}", s.start, s.end));
+            }
+        }
         for r in self
             .language
             .verb_spans
@@ -224,6 +271,7 @@ impl PreparedFactSource {
         if let Some(header) = &self.provider_header {
             header.validate(&chunk.document)?;
             ranges.insert((header.title.start, header.title.end));
+            clause_refs.insert(format!("span:{}-{}", header.title.start, header.title.end));
         }
         ensure!(ranges.len() <= 2048, "span catalog exceeds bound");
         let mut spans = BTreeMap::new();
@@ -251,7 +299,7 @@ impl PreparedFactSource {
             serde_json::to_vec(&links)?.len() <= 128 * 1024,
             "annotated source exceeds bound"
         );
-        let noun_refs = self
+        let noun_refs: std::collections::BTreeSet<String> = self
             .language
             .mentions
             .iter()
@@ -270,7 +318,11 @@ impl PreparedFactSource {
         let action_refs = spans
             .iter()
             .filter(|(_, span)| {
-                span.range.start >= business_start
+                (span.range.start >= business_start
+                    || self
+                        .provider_header
+                        .as_ref()
+                        .is_some_and(|h| h.title == span.range))
                     && self
                         .language
                         .verb_spans
@@ -281,7 +333,66 @@ impl PreparedFactSource {
             .collect();
         let record_ref = root_range.map(|r| format!("span:{}-{}", r.start, r.end));
         let mut evidence_refs = clause_refs.clone();
+        evidence_refs.extend(sentence_refs.iter().cloned());
         evidence_refs.insert(format!("span:{}-{}", chunk.range.start, chunk.range.end));
+        let mut attribution_hypotheses = Vec::new();
+        let mut reporting_units = std::collections::BTreeSet::new();
+        // Only an NLP-issued noun immediately before an NLP-issued reporting
+        // verb is proposed. This is a hypothesis, never an identity/role repair.
+        for unit in &evidence_refs {
+            let scope = &spans[unit];
+            for verb in &self.language.verb_spans {
+                if verb.start < scope.range.start
+                    || verb.end > scope.range.end
+                    || verb.start < business_start
+                {
+                    continue;
+                }
+                let word = verb.text(&chunk.document)?.to_lowercase();
+                if ![
+                    "reported",
+                    "reports",
+                    "confirmed",
+                    "said",
+                    "stated",
+                    "agreed",
+                    "noted",
+                ]
+                .contains(&word.as_str())
+                {
+                    continue;
+                }
+                reporting_units.insert(unit.clone());
+                let reporter = noun_refs
+                    .iter()
+                    .filter(|r| {
+                        let s = &spans[*r];
+                        s.range.start >= scope.range.start
+                            && s.range.end <= verb.start
+                            && chunk.document.text[s.range.end..verb.start]
+                                .chars()
+                                .all(|c| c.is_whitespace() || matches!(c, ',' | ':' | '—'))
+                    })
+                    .max_by_key(|r| {
+                        let s = &spans[*r];
+                        (s.range.end, std::cmp::Reverse(s.range.start))
+                    });
+                if let Some(reporter) = reporter {
+                    let verb_ref = format!("span:{}-{}", verb.start, verb.end);
+                    if spans.contains_key(&verb_ref) {
+                        attribution_hypotheses.push(AttributionHypothesis {
+                            evidence_ref: unit.clone(),
+                            reporter_ref: reporter.clone(),
+                            verb_ref,
+                        });
+                    }
+                }
+            }
+        }
+        let instruction_title_ref = self
+            .provider_header
+            .as_ref()
+            .map(|h| format!("span:{}-{}", h.title.start, h.title.end));
         Ok(SpanCatalog {
             document: chunk.document.key.clone(),
             content_hash: self.content_hash.clone(),
@@ -293,6 +404,10 @@ impl PreparedFactSource {
             record_ref,
             business_start,
             evidence_refs,
+            attribution_hypotheses,
+            instruction_title_ref,
+            reporting_units,
+            sentence_refs,
         })
     }
 }

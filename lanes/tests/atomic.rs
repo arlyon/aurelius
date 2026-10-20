@@ -25,6 +25,7 @@ fn fixture() -> Result<(Chunk, PreparedFactSource, Registry)> {
     };
     // Validator fixtures only, not a replacement NLP runtime.
     let language = LanguageAnalysis {
+        sentence_spans: vec![],
         document: document.key.clone(),
         content_hash: document.content_hash(),
         profile: "a".repeat(64),
@@ -119,6 +120,7 @@ fn fixture() -> Result<(Chunk, PreparedFactSource, Registry)> {
             name.into(),
             PredicateSpec {
                 description: format!("Synthetic {name} contract"),
+                allowed_modes: vec![],
                 subject_types: types,
                 object,
                 render: render.into(),

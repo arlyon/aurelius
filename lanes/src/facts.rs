@@ -440,7 +440,7 @@ impl ChatExtractor {
             &self.atomic_profile,
             max_output_tokens,
         )?;
-        let format = json!({"type":"json_schema","name":"atomic_spo_v1","strict":true,"schema":request.schema});
+        let format = json!({"type":"json_schema","name":crate::atomic::FORMAT_NAME,"strict":true,"schema":request.schema});
         let output = self
             .complete_formatted(
                 chunk,

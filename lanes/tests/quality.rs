@@ -57,6 +57,7 @@ fn fixture() -> Result<(Chunk, PreparedFactSource, Config, QualityConfig)> {
         content_hash: document.content_hash(),
         preparation_profile: "a".repeat(64),
         language: LanguageAnalysis {
+            sentence_spans: vec![],
             document: document.key.clone(),
             content_hash: document.content_hash(),
             profile: "b".repeat(64),

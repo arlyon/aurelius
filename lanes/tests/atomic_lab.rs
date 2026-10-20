@@ -109,6 +109,11 @@ async fn actual_neural_preparation_budgeted_mock_and_credential_free_bound_repla
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     let cached = fact_lab::load(&live.output.join("prepared-records.json"))?;
+    assert!(cached.iter().all(|r| {
+        r.prepared
+            .as_ref()
+            .is_some_and(|p| !p.language.sentence_spans.is_empty())
+    }));
     config.chat.as_mut().unwrap().api_key_env =
         Some("ATOMIC_REPLAY_MUST_NOT_READ_CREDENTIALS".into());
     let replay = Options {

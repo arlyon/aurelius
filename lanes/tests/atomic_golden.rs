@@ -70,6 +70,7 @@ fn fixture(case: &Value) -> Result<(Chunk, PreparedFactSource, Value)> {
         .map(|s| range(text, s.as_str().unwrap()))
         .collect();
     let language = LanguageAnalysis {
+        sentence_spans: vec![],
         document: document.key.clone(),
         content_hash: document.content_hash(),
         profile: "a".repeat(64),
@@ -459,5 +460,100 @@ fn native_review_identifiers_and_money_punctuation_match_the_contract() -> Resul
             .len(),
         1
     );
+    Ok(())
+}
+#[test]
+fn reporting_hypotheses_require_exact_source_reporter_without_autofill() -> Result<()> {
+    let mut case = cases()?
+        .into_iter()
+        .find(|c| c["name"] == "reported_ownership")
+        .unwrap();
+    case["verbs"] = json!(["reported"]);
+    let (c, p, mut body) = fixture(&case)?;
+    let catalog = p.span_catalog(&c)?;
+    let registry = registry()?;
+    assert!(
+        catalog.requires_attribution(
+            body["assertions"][0]["evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+                .as_slice()
+        )
+    );
+    body["assertions"][0]["qualification"]["attribution"] = json!([]);
+    let rejected = atomic::validate(&body.to_string(), &catalog, &registry)?;
+    assert!(rejected.assertions.is_empty());
+    assert_eq!(
+        rejected.review_items[0].reason,
+        atomic::Reason::MissingAttribution
+    );
+    body["assertions"][0]["qualification"]["attribution"] = json!([{"ref":"j"}]);
+    let accepted = atomic::validate(&body.to_string(), &catalog, &registry)?;
+    assert_eq!(accepted.assertions.len(), 1);
+    Ok(())
+}
+#[test]
+fn task_title_requests_do_not_become_completed_business_actions() -> Result<()> {
+    let source = "Task: Create artist profile\nStatus: completed\n\nNo artist page exists.";
+    let case = json!({"source":source,"verbs":["Create"],"entities":[["a","action","Create artist profile","create"],["p","artist_profile","artist profile",null]],"facts":[{"subject":"a","predicate":"target","object":{"kind":"entity","ref":"p"},"mode":"required","quote":source}]});
+    let (c, mut p, mut body) = fixture(&case)?;
+    p.provider_header = Some(aurelius_lanes::provider_metadata::ProviderTaskHeader {
+        text: "Task: Create artist profile\nStatus: completed\n\n".into(),
+        title: range(source, "Create artist profile"),
+    });
+    let catalog = p.span_catalog(&c)?;
+    let registry = registry()?;
+    assert_eq!(
+        atomic::validate(&body.to_string(), &catalog, &registry)?
+            .assertions
+            .len(),
+        1
+    );
+    body["assertions"][0]["qualification"]["mode"] = json!("asserted");
+    let rejected = atomic::validate(&body.to_string(), &catalog, &registry)?;
+    assert!(rejected.assertions.is_empty());
+    assert_eq!(
+        rejected.review_items[0].reason,
+        atomic::Reason::ActionIncomplete
+    );
+    Ok(())
+}
+#[test]
+fn typed_values_cannot_drop_negation_units_or_forecast_mode() -> Result<()> {
+    let cases = cases()?;
+    let registry = registry()?;
+    for (name, index, value) in [
+        ("artist_profile_explicitly_absent", 0, "exists"),
+        ("worked_hours_and_unbilled_period", 1, "billed"),
+    ] {
+        let case = cases.iter().find(|c| c["name"] == name).unwrap();
+        let (c, p, mut body) = fixture(case)?;
+        body["assertions"][index]["object"]["value"] = json!(value);
+        let g = atomic::validate(&body.to_string(), &p.span_catalog(&c)?, &registry)?;
+        assert!(
+            g.review_items
+                .iter()
+                .any(|r| r.reason == atomic::Reason::InvalidTarget)
+        );
+    }
+    let case = cases
+        .iter()
+        .find(|c| c["name"] == "field_layout_budget_and_forecast_are_separate")
+        .unwrap();
+    let (c, p, mut body) = fixture(case)?;
+    body["assertions"][1]["qualification"]["mode"] = json!("asserted");
+    let g = atomic::validate(&body.to_string(), &p.span_catalog(&c)?, &registry)?;
+    assert_eq!(g.assertions.len(), 1);
+    assert_eq!(g.review_items[0].reason, atomic::Reason::AmbiguousScope);
+    let case = cases
+        .iter()
+        .find(|c| c["name"] == "initial_spend_and_zero_conversions")
+        .unwrap();
+    let (c, p, mut body) = fixture(case)?;
+    body["assertions"][1]["object"]["unit"] = json!("hour");
+    assert!(atomic::validate(&body.to_string(), &p.span_catalog(&c)?, &registry).is_err());
     Ok(())
 }
