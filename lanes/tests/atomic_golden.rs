@@ -446,9 +446,11 @@ fn native_review_identifiers_and_money_punctuation_match_the_contract() -> Resul
         let graph = atomic::validate(&body.to_string(), &catalog, &registry)?;
         assert_eq!(graph.assertions.len(), 1);
         let schema = registry.schema(&catalog)?;
-        let review = &schema["properties"]["review_items"]["items"]["anyOf"][0]["properties"];
-        let identifier =
-            regex::Regex::new(review["intended_predicate"]["pattern"].as_str().unwrap())?;
+        let identifier = regex::Regex::new(
+            schema["$defs"]["review_identifier"]["pattern"]
+                .as_str()
+                .unwrap(),
+        )?;
         assert!(identifier.is_match("requested_push_action"));
         assert!(!identifier.is_match("requested push action"));
     }
@@ -555,5 +557,63 @@ fn typed_values_cannot_drop_negation_units_or_forecast_mode() -> Result<()> {
     let (c, p, mut body) = fixture(case)?;
     body["assertions"][1]["object"]["unit"] = json!("hour");
     assert!(atomic::validate(&body.to_string(), &p.span_catalog(&c)?, &registry).is_err());
+    Ok(())
+}
+#[test]
+fn duplicate_entity_ids_reject_dependents_without_guessing_or_dropping_siblings() -> Result<()> {
+    let case = cases()?
+        .into_iter()
+        .find(|c| c["name"] == "partial_access_is_not_ownership")
+        .unwrap();
+    let (c, p, mut body) = fixture(&case)?;
+    let duplicate = body["local_entities"][1].clone();
+    body["local_entities"]
+        .as_array_mut()
+        .unwrap()
+        .push(duplicate);
+    let graph = atomic::validate(&body.to_string(), &p.span_catalog(&c)?, &registry()?)?;
+    assert_eq!(graph.assertions.len(), 2);
+    assert_eq!(graph.review_items.len(), 1);
+    assert_eq!(
+        graph.review_items[0].reason,
+        atomic::Reason::UnresolvedEntity
+    );
+    assert!(graph.unresolved_entity_ids.contains("n"));
+    assert!(!graph.entities.contains_key("n"));
+    Ok(())
+}
+#[test]
+fn bounded_long_review_catalog_shares_native_field_definitions() -> Result<()> {
+    let source = format!(
+        "Reporting schedule\n{}",
+        (0..80)
+            .map(|n| format!(
+                "Reporting requirement {n}: retain the independently scoped source metric {n}.\n"
+            ))
+            .collect::<String>()
+    );
+    let case = json!({"source":source,"entities":[["r","report_schedule","Reporting schedule",null]],"facts":[]});
+    let (c, p, _) = fixture(&case)?;
+    let schema = registry()?.schema(&p.span_catalog(&c)?)?;
+    assert!(serde_json::to_vec(&schema)?.len() <= 128 * 1024);
+    check_schema(&schema);
+    assert_eq!(
+        schema["properties"]["review_items"]["items"]["anyOf"][0]["properties"]["reason"]["$ref"],
+        "#/$defs/review_reason"
+    );
+    let oversized = format!(
+        "Reporting schedule\n{}",
+        (0..180)
+            .map(|n| format!(
+                "Reporting requirement {n}: retain the independently scoped source metric {n}.\n"
+            ))
+            .collect::<String>()
+    );
+    let case = json!({"source":oversized,"entities":[["r","report_schedule","Reporting schedule",null]],"facts":[]});
+    let (c, p, _) = fixture(&case)?;
+    let catalog = p.span_catalog(&c)?;
+    assert_eq!(catalog.evidence_hrefs().len(), 182);
+    assert!(registry()?.schema(&catalog).is_err());
+    assert_eq!(catalog.evidence_hrefs().len(), 182);
     Ok(())
 }

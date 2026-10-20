@@ -128,12 +128,22 @@ pub struct SpanCatalog {
     instruction_title_ref: Option<String>,
     reporting_units: std::collections::BTreeSet<String>,
     sentence_refs: std::collections::BTreeSet<String>,
+    window_ref: String,
 }
 impl SpanCatalog {
     pub fn resolve(&self, href: &str) -> Result<&crate::contracts::SourceSpan> {
         self.spans
             .get(href)
             .ok_or_else(|| anyhow::anyhow!("unissued evidence marker"))
+    }
+    pub fn review_hrefs(&self) -> Vec<String> {
+        if self.sentence_refs.is_empty() {
+            self.evidence_hrefs()
+        } else {
+            let mut units = self.sentence_refs.clone();
+            units.insert(self.window_ref.clone());
+            units.into_iter().collect()
+        }
     }
     pub fn evidence_hrefs(&self) -> Vec<String> {
         self.evidence_refs.iter().cloned().collect()
@@ -408,6 +418,7 @@ impl PreparedFactSource {
             instruction_title_ref,
             reporting_units,
             sentence_refs,
+            window_ref: format!("span:{}-{}", chunk.range.start, chunk.range.end),
         })
     }
 }
