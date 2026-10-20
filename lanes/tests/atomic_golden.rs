@@ -413,3 +413,22 @@ fn paid_probe_regressions_are_constrained_during_native_generation() -> Result<(
     assert!(!catalog.evidence_hrefs().contains(&nora));
     Ok(())
 }
+#[test]
+fn noun_like_action_headings_are_not_named_entity_anchors() -> Result<()> {
+    let case = json!({"source":"Reporting schedule\n[Jordan] Provide Lead Flows","entities":[["j","person","[Jordan] Provide Lead Flows",null]],"facts":[],"verbs":["Provide"]});
+    let (c, p, _) = fixture(&case)?;
+    let catalog = p.span_catalog(&c)?;
+    let heading = href(&c.document.text, "[Jordan] Provide Lead Flows");
+    assert!(catalog.resolve(&heading).is_ok());
+    assert!(
+        !catalog
+            .anchor_hrefs(&atomic::AnchorKind::Mention)
+            .contains(&heading)
+    );
+    assert!(
+        catalog
+            .anchor_hrefs(&atomic::AnchorKind::Action)
+            .contains(&heading)
+    );
+    Ok(())
+}

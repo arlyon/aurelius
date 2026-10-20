@@ -255,7 +255,15 @@ impl PreparedFactSource {
             .language
             .mentions
             .iter()
-            .filter(|m| m.noun && !m.pronoun)
+            .filter(|m| {
+                m.noun
+                    && !m.pronoun
+                    && !self
+                        .language
+                        .verb_spans
+                        .iter()
+                        .any(|v| v.start < m.range.end && m.range.start < v.end)
+            })
             .map(|m| format!("span:{}-{}", m.range.start, m.range.end))
             .filter(|href| spans.contains_key(href))
             .collect();
