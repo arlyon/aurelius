@@ -1,3 +1,6 @@
+#[cfg(feature = "language")]
+#[path = "support/atomic_postgres.rs"]
+mod atomic_postgres;
 #[path = "support/fact_context.rs"]
 mod fact_context;
 #[cfg(feature = "temporal-tests")]
@@ -333,6 +336,16 @@ async fn direct_ingestion_keeps_source_storage_read_only(
     ) -> (axum::http::StatusCode, Json<Value>) {
         calls.fetch_add(1, Ordering::SeqCst);
         assert_eq!(body["model"], "gpt-6-luna");
+        if body.pointer("/text/format/name").and_then(Value::as_str)
+            == Some(aurelius_lanes::atomic::FORMAT_NAME)
+        {
+            return (
+                axum::http::StatusCode::OK,
+                Json(
+                    json!({"status":"completed","usage":{"input_tokens":20,"output_tokens":30},"output":[{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"{\"local_entities\":[],\"assertions\":[],\"review_items\":[]}"}]}]}),
+                ),
+            );
+        }
         let input: Value =
             serde_json::from_str(body["input"][1]["content"].as_str().expect("fixture input"))
                 .expect("fixture input JSON");
@@ -665,6 +678,8 @@ async fn direct_ingestion_keeps_source_storage_read_only(
     notification_http::qualify(settings.clone(), sink.clone()).await?;
     #[cfg(feature = "language")]
     quality_engine::exercise(&config_text, &sink, admin, calls.clone()).await?;
+    #[cfg(feature = "language")]
+    atomic_postgres::exercise(&sink, admin, &config_text).await?;
     provider_properties::exercise(settings.clone(), &sink, &config_text, calls.clone()).await?;
     std::fs::remove_file(config_path)?;
     server.abort();

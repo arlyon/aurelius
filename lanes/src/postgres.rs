@@ -87,6 +87,13 @@ mod driver {
         pub sources: Vec<crate::document::SourceRef>,
     }
 
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub struct FactManifestEntry {
+        pub artifact_id: String,
+        pub revision: String,
+        pub windows: i64,
+    }
+
     fn database_error(error: sqlx::Error) -> anyhow::Error {
         let code = error
             .as_database_error()
@@ -281,6 +288,57 @@ mod driver {
             request: &crate::fact_context::ContextRequest,
         ) -> Result<crate::fact_context::FactContext> {
             crate::fact_context::read(&self.pool, config, request).await
+        }
+        pub async fn fact_manifest(
+            &self,
+            scope: &str,
+            source_profiles: &[String],
+            seed: &str,
+        ) -> Result<Vec<FactManifestEntry>> {
+            ensure!(
+                !source_profiles.is_empty() && source_profiles.len() <= 100,
+                "source profiles required"
+            );
+            let mut tx = self.tenant(scope).await?;
+            let mut query = QueryBuilder::<Postgres>::new(
+                "SELECT id,revision_id,(metadata->>'chunk_count')::bigint AS windows FROM ",
+            );
+            query.push(&self.artifacts).push(" WHERE organization_id=$1 AND deleted_at IS NULL AND metadata->>'profile'=ANY($2::text[]) AND (metadata->>'chunk_count')::bigint>0 AND NOT(metadata ? 'candidate_graph') ORDER BY md5(id || $3),id LIMIT 20001");
+            let rows = query
+                .build()
+                .bind(scope)
+                .bind(source_profiles)
+                .bind(seed)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(database_error)?;
+            ensure!(
+                rows.len() <= 20000,
+                "source manifest exceeds document bound"
+            );
+            let entries = rows
+                .into_iter()
+                .map(|row| {
+                    Ok(FactManifestEntry {
+                        artifact_id: row.try_get("id").map_err(database_error)?,
+                        revision: row.try_get("revision_id").map_err(database_error)?,
+                        windows: row.try_get("windows").map_err(database_error)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            ensure!(
+                entries.iter().all(|e| e.windows > 0
+                    && e.artifact_id.len() == 64
+                    && e.artifact_id.bytes().all(|b| b.is_ascii_hexdigit())
+                    && !e.revision.is_empty())
+                    && entries
+                        .iter()
+                        .try_fold(0_i64, |sum, e| sum.checked_add(e.windows))
+                        .is_some_and(|sum| sum <= 20000),
+                "unsafe or oversized source manifest"
+            );
+            tx.commit().await.map_err(database_error)?;
+            Ok(entries)
         }
         pub async fn next_fact_source(
             &self,
@@ -722,6 +780,52 @@ mod driver {
             self.write_candidate_artifact(chunk, &graph.profile, metadata)
                 .await
         }
+        pub async fn write_atomic_candidates(
+            &self,
+            chunk: &crate::contracts::Chunk,
+            request: &crate::atomic::PreparedRequest,
+            registry: &crate::atomic::Registry,
+            extracted: &crate::facts::AtomicExtraction,
+        ) -> Result<String> {
+            chunk.text()?;
+            ensure!(
+                request.binding == extracted.binding && request.profile == extracted.profile,
+                "atomic request binding mismatch"
+            );
+            let graph = crate::atomic::validate(&extracted.raw_output, &request.catalog, registry)?;
+            ensure!(
+                graph.document == chunk.document.key
+                    && graph.content_hash == chunk.document.content_hash()
+                    && serde_json::to_value(&graph)? == serde_json::to_value(&extracted.graph)?,
+                "atomic graph/source mismatch"
+            );
+            let local = |span: &crate::contracts::SourceSpan| -> Result<()> {
+                span.validate(&chunk.document)?;
+                let inside =
+                    span.range.start >= chunk.range.start && span.range.end <= chunk.range.end;
+                let issued_context = request
+                    .catalog
+                    .record_anchor()
+                    .is_ok_and(|record| record.range == span.range)
+                    || request.catalog.is_instruction_title(span);
+                ensure!(
+                    inside || issued_context,
+                    "atomic span outside window or issued context"
+                );
+                Ok(())
+            };
+            for entity in graph.entities.values() {
+                local(&entity.anchor)?;
+            }
+            for assertion in &graph.assertions {
+                for span in &assertion.evidence {
+                    local(span)?;
+                }
+            }
+            let metadata = json!({"status":"candidate","profile":request.profile,"source_artifact_id":chunk.document.key.source,"source_revision":chunk.document.key.revision,"source_range":chunk.range,"source_content_hash":graph.content_hash,"candidate_graph":graph,"request_binding":request.binding,"generation":extracted.raw_output,"usage":extracted.usage,"chunk_count":0});
+            self.write_candidate_artifact(chunk, &request.profile, metadata)
+                .await
+        }
         pub async fn write_provider_properties(
             &self,
             input: &ExtractionInput,
@@ -836,7 +940,7 @@ mod driver {
             let mut parent = QueryBuilder::<Postgres>::new("SELECT revision_id,source_uri FROM ");
             parent
                 .push(&self.artifacts)
-                .push(" WHERE id=$1 AND organization_id=$2");
+                .push(" WHERE id=$1 AND organization_id=$2 AND deleted_at IS NULL");
             let source = parent
                 .build()
                 .bind(&chunk.document.key.source)
@@ -1001,7 +1105,7 @@ mod driver {
     }
 }
 #[cfg(feature = "postgres")]
-pub use driver::{ExtractionInput, PostgresSink, StoredDocument};
+pub use driver::{ExtractionInput, FactManifestEntry, PostgresSink, StoredDocument};
 
 #[cfg(test)]
 mod tests {

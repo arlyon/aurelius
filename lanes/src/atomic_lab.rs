@@ -5,7 +5,10 @@ use crate::{
     config::Config,
     contracts::Chunk,
     fact_lab::{self, LabRecord, Mode, Options, Preparation, bounded, private_json},
-    facts::{ChatExtractor, ExtractionUsage, review_diagnostic, review_output, review_usage},
+    facts::{
+        ChatExtractor, ExtractionUsage, review_diagnostic, review_output, review_transport,
+        review_usage,
+    },
     run_budget::RunBudget,
 };
 use anyhow::{Context, Result, ensure};
@@ -188,7 +191,7 @@ pub async fn run(
             }
             private_json(
                 &options.output.join(format!("failure-{}.json", unit.id)),
-                &json!({"diagnostic":review_diagnostic(&error),"raw_output":review_output(&error),"usage":review_usage(&error)}),
+                &json!({"diagnostic":review_diagnostic(&error),"transport":review_transport(&error),"raw_output":review_output(&error),"usage":review_usage(&error)}),
             )?;
         }
     }

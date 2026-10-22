@@ -1,6 +1,8 @@
 pub mod atomic;
 #[cfg(feature = "language")]
 pub mod atomic_lab;
+#[cfg(all(feature = "postgres", feature = "language"))]
+pub mod atomic_pg;
 pub mod config;
 pub mod contracts;
 pub mod document;

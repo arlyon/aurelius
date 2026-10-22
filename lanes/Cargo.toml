@@ -27,6 +27,16 @@ path = "tests/fact_lab.rs"
 required-features = ["language"]
 
 [[example]]
+name = "atomic_snapshot"
+path = "examples/atomic_snapshot.rs"
+required-features = ["postgres", "language"]
+
+[[example]]
+name = "atomic_facts"
+path = "examples/atomic_facts.rs"
+required-features = ["postgres", "language"]
+
+[[example]]
 name = "weekend_facts"
 path = "examples/weekend_facts.rs"
 required-features = ["postgres", "language"]

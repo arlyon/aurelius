@@ -143,6 +143,10 @@ pub enum ReviewDiagnostic {
     InputBudget,
     NativeSchemaUnsupported,
     NativeSchemaViolation,
+    TransportTimeout,
+    TransportFailure,
+    HttpFailure,
+    MissingUsage,
 }
 impl std::fmt::Display for ReviewDiagnostic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -192,6 +196,77 @@ pub fn review_output(error: &anyhow::Error) -> Option<&str> {
         .downcast_ref::<OutputTrace>()
         .map(|trace| trace.0.as_str())
 }
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportPhase {
+    Send,
+    Body,
+    Envelope,
+}
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportKind {
+    Timeout,
+    Connect,
+    Request,
+    Body,
+    HttpStatus,
+    MissingUsage,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct TransportFailure {
+    pub phase: TransportPhase,
+    pub kind: TransportKind,
+    pub status: Option<u16>,
+    pub gateway_log_id: Option<String>,
+}
+impl std::fmt::Display for TransportFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "extraction transport failure: {:?}", self.kind)
+    }
+}
+impl std::error::Error for TransportFailure {}
+pub fn review_transport(error: &anyhow::Error) -> Option<&TransportFailure> {
+    error.downcast_ref::<TransportFailure>()
+}
+fn transport_failure(
+    phase: TransportPhase,
+    kind: TransportKind,
+    status: Option<u16>,
+    gateway_log_id: Option<String>,
+) -> anyhow::Error {
+    let diagnostic = match kind {
+        TransportKind::Timeout => ReviewDiagnostic::TransportTimeout,
+        TransportKind::HttpStatus => ReviewDiagnostic::HttpFailure,
+        TransportKind::MissingUsage => ReviewDiagnostic::MissingUsage,
+        _ => ReviewDiagnostic::TransportFailure,
+    };
+    anyhow::Error::new(TransportFailure {
+        phase,
+        kind,
+        status,
+        gateway_log_id,
+    })
+    .context(diagnostic)
+}
+fn transport_error(
+    error: reqwest::Error,
+    phase: TransportPhase,
+    status: Option<u16>,
+    gateway_log_id: Option<String>,
+) -> anyhow::Error {
+    let kind = if error.is_timeout() {
+        TransportKind::Timeout
+    } else if error.is_connect() {
+        TransportKind::Connect
+    } else if matches!(phase, TransportPhase::Body) {
+        TransportKind::Body
+    } else {
+        TransportKind::Request
+    };
+    // Never retain the original error: it can contain a URL or sensitive source-chain details.
+    transport_failure(phase, kind, status, gateway_log_id)
+}
 struct ModelOutput {
     text: String,
     usage: Option<ExtractionUsage>,
@@ -232,8 +307,17 @@ pub struct ChatExtractor {
     gateway: bool,
     references: crate::references::ReferenceConfig,
     run_budget: Option<crate::run_budget::RunBudget>,
+    request_timeout: Duration,
 }
 impl ChatExtractor {
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Result<Self> {
+        ensure!(
+            !timeout.is_zero() && timeout <= Duration::from_secs(600),
+            "invalid extraction request timeout"
+        );
+        self.request_timeout = timeout;
+        Ok(self)
+    }
     pub fn with_run_budget(mut self, budget: crate::run_budget::RunBudget) -> Self {
         self.run_budget = Some(budget);
         self
@@ -315,6 +399,7 @@ impl ChatExtractor {
             gateway: settings.gateway.is_some(),
             references: settings.references.clone(),
             run_budget: None,
+            request_timeout: Duration::from_secs(120),
             atomic_profile,
         })
     }
@@ -506,7 +591,11 @@ impl ChatExtractor {
                 json!({"model":self.model,"max_output_tokens":max_output_tokens,"store":false,"text":{"format":format.cloned().unwrap_or_else(||json!({"type":"json_object"}))},"input":[{"role":"system","content":prompt},{"role":"user","content":input}]})
             }
         };
-        let mut request = self.client.post(self.endpoint.clone()).json(&body);
+        let mut request = self
+            .client
+            .post(self.endpoint.clone())
+            .timeout(self.request_timeout)
+            .json(&body);
         if self.gateway {
             let execution = blake3::hash(&serde_json::to_vec(&(
                 &chunk.document.key,
@@ -531,27 +620,46 @@ impl ChatExtractor {
                 )
             })
             .transpose()?;
-        let mut response = request.send().await?;
-        if format.is_some() && matches!(response.status().as_u16(), 400 | 422) {
+        let mut response = request
+            .send()
+            .await
+            .map_err(|error| transport_error(error, TransportPhase::Send, None, None))?;
+        let status = response.status();
+        let gateway_log_id = response
+            .headers()
+            .get("cf-aig-log-id")
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| {
+                !v.is_empty()
+                    && v.len() <= 128
+                    && v.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+            })
+            .map(str::to_owned);
+        if !status.is_success() {
+            let error = transport_failure(
+                TransportPhase::Send,
+                TransportKind::HttpStatus,
+                Some(status.as_u16()),
+                gateway_log_id,
+            );
             return Err(
-                anyhow::Error::new(ReviewDiagnostic::NativeSchemaUnsupported).context(format!(
-                    "native schema request rejected (HTTP {})",
-                    response.status().as_u16()
-                )),
+                if format.is_some() && matches!(status.as_u16(), 400 | 422) {
+                    error.context(ReviewDiagnostic::NativeSchemaUnsupported)
+                } else {
+                    error
+                },
             );
         }
-        response.error_for_status_ref().map_err(|error| {
-            anyhow::Error::new(error).context(format!(
-                "fact extraction request failed (HTTP {})",
-                response.status().as_u16()
-            ))
-        })?;
-        ensure!(
-            response.status().is_success(),
-            "fact extraction request rejected redirect"
-        );
         let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await? {
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            transport_error(
+                error,
+                TransportPhase::Body,
+                Some(status.as_u16()),
+                gateway_log_id.clone(),
+            )
+        })? {
             if bytes.len() + chunk.len() > MAX_BODY {
                 return Err(anyhow::Error::new(ReviewDiagnostic::ResponseBudget)
                     .context(ExtractionReview::Output));
@@ -579,7 +687,14 @@ impl ChatExtractor {
             let (input, output) = usage
                 .as_ref()
                 .and_then(|u| u.input_tokens.zip(u.output_tokens))
-                .context("provider usage missing; bounded run halted")?;
+                .ok_or_else(|| {
+                    transport_failure(
+                        TransportPhase::Envelope,
+                        TransportKind::MissingUsage,
+                        Some(status.as_u16()),
+                        gateway_log_id.clone(),
+                    )
+                })?;
             permit.settle(input, output)?;
         }
         (|| ->Result<ModelOutput> {
@@ -888,6 +1003,168 @@ mod gateway_tests {
                 .is_err()
         );
         server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn transport_deadlines_are_single_attempt_private_and_keep_reservations() -> Result<()> {
+        use std::{
+            os::unix::fs::DirBuilderExt,
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for mode in [
+            "send_timeout",
+            "body_timeout",
+            "http_failure",
+            "missing_usage",
+            "slow_success",
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let address = listener.local_addr()?;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = calls.clone();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 65536];
+                let received = stream.read(&mut request).await.unwrap();
+                assert!(received > 0, "empty fixture request");
+                observed.fetch_add(1, Ordering::SeqCst);
+                let mut body = json!({"status":"completed","usage":{"input_tokens":10,"output_tokens":10},"output":[{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"{}"}]}]});
+                if mode == "missing_usage" {
+                    body.as_object_mut().unwrap().remove("usage");
+                }
+                let body = if mode == "http_failure" {
+                    "privateFixtureValue123".to_owned()
+                } else {
+                    body.to_string()
+                };
+                if matches!(mode, "send_timeout" | "slow_success") {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                let code = if mode == "http_failure" {
+                    "503 Service Unavailable"
+                } else {
+                    "200 OK"
+                };
+                let headers = format!(
+                    "HTTP/1.1 {code}\r\nContent-Type: application/json\r\ncf-aig-log-id: fixture-log-1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                if stream.write_all(headers.as_bytes()).await.is_err() {
+                    return;
+                }
+                if mode == "body_timeout" {
+                    if stream.write_all(&body.as_bytes()[..1]).await.is_err() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    let _ = stream.write_all(&body.as_bytes()[1..]).await;
+                } else {
+                    let _ = stream.write_all(body.as_bytes()).await;
+                }
+            });
+            let config = ChatConfig {
+                endpoint: format!("http://{address}/privateFixtureValue123/responses"),
+                model: "gpt-6-luna".into(),
+                revision: "transport-fixture".into(),
+                api_key_env: None,
+                api: ChatApi::Responses,
+                gateway: None,
+                references: Default::default(),
+            };
+            let ontology =
+                crate::config::Config::parse(include_str!("../tests/fixtures/business.toml"))?
+                    .ontology;
+            let directory = std::env::temp_dir()
+                .join(format!("transport-budget-{}-{mode}", std::process::id()));
+            std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
+            let budget = crate::run_budget::RunBudget::open(
+                &directory.join("requests.jsonl"),
+                mode.into(),
+                1,
+                1,
+                Duration::from_secs(60),
+            )?;
+            let timeout = if mode == "slow_success" {
+                Duration::from_secs(2)
+            } else {
+                Duration::from_millis(80)
+            };
+            let extractor = ChatExtractor::new(&config, ontology)?
+                .with_request_timeout(timeout)?
+                .with_run_budget(budget.clone());
+            let chunk = Chunk {
+                document: Document {
+                    key: DocumentKey {
+                        scope: "fixture".into(),
+                        source: "fixture".into(),
+                        revision: "1".into(),
+                    },
+                    text: "safe fixture".into(),
+                    context: None,
+                    metadata: Default::default(),
+                },
+                range: ByteRange { start: 0, end: 12 },
+            };
+            let result = extractor
+                .complete_formatted(
+                    &chunk,
+                    "safe fixture",
+                    "safe fixture",
+                    ("profile", "fixture", 512),
+                    None,
+                )
+                .await;
+            if mode == "slow_success" {
+                assert!(result.is_ok());
+                assert!(!budget.snapshot()?.halted);
+                assert_eq!(budget.snapshot()?.charged_nano_usd, 6000);
+            } else {
+                let error = result.err().context("expected transport failure")?;
+                let trace = review_transport(&error).context("safe transport detail missing")?;
+                assert!(!format!("{error:?}").contains("privateFixtureValue123"));
+                assert!(budget.snapshot()?.halted);
+                assert!(budget.snapshot()?.charged_nano_usd > 6000);
+                match mode {
+                    "send_timeout" => {
+                        assert_eq!(
+                            review_diagnostic(&error),
+                            ReviewDiagnostic::TransportTimeout
+                        );
+                        assert!(matches!(trace.phase, TransportPhase::Send));
+                        assert!(trace.status.is_none());
+                    }
+                    "body_timeout" => {
+                        assert_eq!(
+                            review_diagnostic(&error),
+                            ReviewDiagnostic::TransportTimeout
+                        );
+                        assert!(matches!(trace.phase, TransportPhase::Body));
+                        assert_eq!(trace.status, Some(200));
+                        assert_eq!(trace.gateway_log_id.as_deref(), Some("fixture-log-1"));
+                    }
+                    "http_failure" => {
+                        assert_eq!(review_diagnostic(&error), ReviewDiagnostic::HttpFailure);
+                        assert_eq!(trace.status, Some(503));
+                    }
+                    "missing_usage" => {
+                        assert_eq!(review_diagnostic(&error), ReviewDiagnostic::MissingUsage);
+                        assert!(matches!(trace.phase, TransportPhase::Envelope));
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "automatic retry observed");
+            assert_eq!(budget.snapshot()?.calls, 1);
+            drop(extractor);
+            drop(budget);
+            server.abort();
+            std::fs::remove_dir_all(directory)?;
+        }
         Ok(())
     }
 }

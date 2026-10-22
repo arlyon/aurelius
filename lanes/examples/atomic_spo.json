@@ -1,62 +1,187 @@
 {
   "condition_predicates": ["operational_status", "artifact_status"],
   "entity_anchors": {
-    "source_record": "record", "report_schedule": "facet", "ranking_specification": "facet", "budget_plan": "facet",
-    "campaign_activity": "facet", "tracking_configuration": "facet", "incident": "facet", "document": "facet",
-    "person": "mention", "organization": "mention", "provider": "mention", "platform_account": "mention", "action": "action",
-    "work_period": "facet", "access_grant": "facet", "workspace": "facet", "artist_profile": "facet", "workflow": "facet",
-    "software_user": "facet", "collection": "facet", "platform_page": "facet", "ranking_entry": "facet"
+    "source_record": "record",
+    "report_schedule": "facet",
+    "ranking_specification": "facet",
+    "budget_plan": "facet",
+    "campaign_activity": "facet",
+    "tracking_configuration": "facet",
+    "incident": "facet",
+    "document": "facet",
+    "person": "mention",
+    "organization": "mention",
+    "provider": "mention",
+    "platform_account": "mention",
+    "action": "action",
+    "work_period": "facet",
+    "access_grant": "facet",
+    "workspace": "facet",
+    "artist_profile": "facet",
+    "workflow": "facet",
+    "software_user": "facet",
+    "collection": "facet",
+    "platform_page": "facet",
+    "ranking_entry": "facet"
   },
-  "facet_forms": {
-    "report_schedule": ["report", "reporting", "stats", "metrics"],
-    "ranking_specification": ["ad groups", "headlines", "ranking"],
-    "budget_plan": ["budget", "plan", "ramp", "Target Spend", "Predicted Spend"],
-    "campaign_activity": ["campaign", "campaigns", "advertising", "ads", "paid search"],
-    "tracking_configuration": ["UTM", "UTMs", "tracking", "HubSpot"],
-    "incident": ["issue", "incident", "duplicate", "duplicates", "missing"],
-    "document": ["document", "prompt", "worksheet", "report", "image", "bio"],
-    "work_period": ["hours", "week", "weeks", "billing"],
-    "access_grant": ["access", "permissions", "control", "administrator"],
-    "workspace": ["warehouse", "folder", "board", "workspace", "shared media"],
-    "artist_profile": ["artist", "profile", "artist page"],
-    "workflow": ["workflow", "scoring model", "sequence", "sequencing"],
-    "software_user": ["user", "provision", "Staff role"],
-    "collection": ["list", "catalog", "blogs", "index"],
-    "platform_page": ["page", "business portal"],
-    "ranking_entry": ["chart", "Popular", "HypeM", "rank", "hit #"]
+  "entity_descriptions": {
+    "document": "An information/content artifact: ad copy, creative assets, notes, prompts, templates or other documents. Not the activity of creating, updating or reviewing the content. Its identity anchor must denote the artifact, not an unrelated word or an imperative instruction.",
+    "campaign_activity": "The advertising campaign or source-defined campaign cohort/activity itself. Ad-copy text, creative assets, reports and configuration settings are not campaign_activity merely because they concern a campaign.",
+    "action": "A specific source-described action/event with the declared action kind. Use an anchor identifying that action, not an auxiliary/modal word alone, its object alone, or an unrelated neighbouring task. Proposed/requested work is not completed work.",
+    "tracking_configuration": "Actual configured tracking parameters, tags, event definitions or scoring configuration. Not the instruction to investigate/verify them and not a content artifact about configuration.",
+    "budget_plan": "The source-scoped budget/target-spend plan, not the campaign itself, a budget delta, an actual spend measurement or a forecast. Currency may be explicitly unknown.",
+    "access_grant": "A source-scoped permission/access relationship, distinct from the account/page/resource to which access applies. Sharing a public link does not by itself grant access rights.",
+    "person": "A human participant identified by the source, not a field label, organisation or opaque software account. Do not turn a proposer/requester/speaker into an executor without an explicit assignment or commitment.",
+    "software_user": "An opaque source-system account explicitly identified in the source, not an inferred real-world person. Preserve source-local identity and do not guess a human name."
   },
   "predicates": {
-    "pull_deadline": {"description": "Required or planned time to pull the scoped report; never its coverage period.", "subject_types": ["report_schedule"], "object": {"kind": "weekly_local_time"}, "render": "{subject} has pull deadline {object}"},
-    "coverage_period": {"description": "The period covered by this report, not its pull deadline.", "subject_types": ["report_schedule"], "object": {"kind": "code", "parameters": {"prior_mon_sun": ["prior Mon-Sun", "previous Monday through Sunday", "prior Monday-Sunday"]}}, "render": "{subject} covers {object}"},
-    "delivery_channel": {"description": "The source-declared channel for report delivery.", "subject_types": ["report_schedule"], "object": {"kind": "code", "parameters": {"slack": ["Slack"], "email": ["email"]}}, "render": "{subject} is delivered via {object}"},
-    "delivery_recipient": {"description": "The recipient of the report, not its requester or executor.", "subject_types": ["report_schedule"], "object": {"kind": "entity", "parameters": ["person"]}, "render": "{subject} is delivered to {object}"},
-    "ranking_metric": {"description": "The specific metric for a source-scoped ranking, not ownership of an agency/client metric.", "subject_types": ["ranking_specification"], "object": {"kind": "code", "parameters": {"form_fills": ["FORM FILLS", "form fills"], "ctr": ["CTR"]}}, "render": "{subject} is ranked by {object}"},
-    "owned_by": {"description": "Explicit ownership of the referenced platform account, not page access, tenant access, management or authorship. Preserve the named reporter of reported ownership.", "subject_types": ["platform_account"], "object": {"kind": "entity", "parameters": ["organization"]}, "render": "{subject} is owned by {object}"},
-    "monthly_budget": {"description": "Explicit total monthly budget or monthly target spend, including a separate Timeframe: Month field; never a delta, predicted spend or multi-month total. Dollar symbols do not imply USD.", "subject_types": ["budget_plan"], "object": {"kind": "money"}, "render": "{subject} has monthly budget {object}"},
-    "ramp_duration": {"description": "Explicit duration of the scoped plan's ramp; separate from budget amount.", "subject_types": ["budget_plan"], "object": {"kind": "duration"}, "render": "{subject} has ramp duration {object}"},
-    "operational_status": {"description": "Status of scoped advertising activity or tracking, never the provider organization. Live status may also be an explicit conditional prerequisite.", "subject_types": ["campaign_activity", "tracking_configuration"], "object": {"kind": "code", "parameters": {"paused": ["paused", "pause"], "live": ["live"], "blocked": ["blocked"], "missing": ["missing", "don’t have utms", "don't have utms", "do not have utms"], "active": ["active"]}}, "render": "{subject} has operational status {object}"},
-    "executor": {"description": "Source-assigned executor of a complete action, not its requester or recipient. A software_user is an opaque source account, never an inferred person. Retain explicit actors even for target-only action kinds.", "subject_types": ["action"], "object": {"kind": "entity", "parameters": ["person", "software_user"]}, "render": "{subject} has executor {object}"},
-    "recipient": {"description": "Explicit recipient of a complete action; a person or organization, never an inferred tenant.", "subject_types": ["action"], "object": {"kind": "entity", "parameters": ["person", "organization", "software_user"]}, "render": "{subject} has recipient {object}"},
-    "target": {"description": "Specific core target of an action; it must also satisfy that action kind's target types. A bare unknown purpose is not a target.", "subject_types": ["action"], "object": {"kind": "entity", "parameters": ["document", "report_schedule", "platform_account", "campaign_activity", "tracking_configuration", "incident", "action", "workspace", "artist_profile", "workflow", "software_user", "collection", "platform_page", "access_grant"]}, "render": "{subject} targets {object}"},
-    "hours_worked": {"description": "Explicit hours for the source-defined work period. Preserve the anchored period and unresolved worker; do not invent a year or tenant owner.", "subject_types": ["work_period"], "object": {"kind": "quantity", "parameters": {"unit": "hour", "aliases": ["hour", "hours"], "zero_forms": ["no hours", "zero hours"]}}, "render": "{subject} has worked time {object}"},
-    "billing_status": {"description": "Explicit billed/unbilled status for the source-defined hours/period. Doing billing now is not proof it has completed.", "subject_types": ["work_period"], "object": {"kind": "code", "parameters": {"billed": ["billed"], "unbilled": ["haven't billed", "haven’t billed", "not billed", "unbilled"]}}, "render": "{subject} has billing status {object}"},
-    "initial_spend": {"description": "Explicit initial spend on the scoped campaign and source-defined period, not a budget or forecast.", "subject_types": ["campaign_activity"], "object": {"kind": "money_amount"}, "render": "{subject} has initial spend {object}"},
-    "conversion_count": {"description": "Explicit conversion count for the scoped campaign/source period. No conversions means zero, not unknown.", "subject_types": ["campaign_activity"], "object": {"kind": "quantity", "parameters": {"unit": "conversion", "aliases": ["conversion", "conversions"], "zero_forms": ["no conversions", "zero conversions"]}}, "render": "{subject} has conversion count {object}"},
-    "predicted_spend": {"allowed_modes": ["hypothetical", "planned"], "description": "Explicit predicted spend/forecast, separate from target budget and actual spend. Use hypothetical or planned mode, never asserted actual spend.", "subject_types": ["budget_plan"], "object": {"kind": "money_amount"}, "render": "{subject} forecasts spend {object}"},
-    "rank_position": {"description": "Explicit rank of a source-defined chart entry. Preserve the scoped chart/period; do not imply the rank is current.", "subject_types": ["ranking_entry"], "object": {"kind": "quantity", "parameters": {"unit": "rank", "aliases": ["#", "rank", "position"], "zero_forms": []}}, "render": "{subject} has rank {object}"},
-    "access_level": {"description": "Source-scoped partial/full/blocked permission grant, not ownership. Different source stages must remain distinct.", "subject_types": ["access_grant"], "object": {"kind": "code", "parameters": {"partial": ["partial access", "partial administrative access"], "full": ["full access", "full page access", "full control"], "blocked": ["blocked", "restrictions", "restriction"]}}, "render": "{subject} has access level {object}"},
-    "granted_to": {"description": "Explicit grantee of the scoped access grant, not an owner or administrator by inference.", "subject_types": ["access_grant"], "object": {"kind": "entity", "parameters": ["person", "organization"]}, "render": "{subject} is granted to {object}"},
-    "access_target": {"description": "The specific page/account/workspace covered by the scoped access grant.", "subject_types": ["access_grant"], "object": {"kind": "entity", "parameters": ["platform_page", "platform_account", "workspace"]}, "render": "{subject} gives access to {object}"},
-    "artifact_status": {"description": "Explicit existence or absence of a scoped artifact/profile. An instruction to create it does not prove it exists.", "subject_types": ["artist_profile", "platform_page", "document", "workspace"], "object": {"kind": "code", "parameters": {"exists": ["exists", "profile exists", "page exists"], "absent": ["no artist page exists", "no artist page", "does not exist", "doesn't exist", "confirmed gap"]}}, "render": "{subject} has existence status {object}"},
-    "workflow_owned_by": {"description": "Explicit responsibility for a source-scoped workflow; distinct from ownership of an advertising account.", "subject_types": ["workflow"], "object": {"kind": "entity", "parameters": ["person", "organization"]}, "render": "{subject} is owned by {object}"}
+    "pull_deadline": {
+      "description": "Required or planned time to pull the scoped report; never its coverage period.",
+      "subject_types": ["report_schedule"],
+      "object": {"kind": "weekly_local_time"},
+      "render": "{subject} has pull deadline {object}"
+    },
+    "coverage_period": {
+      "description": "The period covered by this report, not its pull deadline.",
+      "subject_types": ["report_schedule"],
+      "object": {"kind": "code", "parameters": ["prior_mon_sun"]},
+      "render": "{subject} covers {object}"
+    },
+    "delivery_channel": {
+      "description": "The source-declared channel for report delivery.",
+      "subject_types": ["report_schedule"],
+      "object": {"kind": "code", "parameters": ["slack", "email"]},
+      "render": "{subject} is delivered via {object}"
+    },
+    "delivery_recipient": {
+      "description": "The recipient of the report, not its requester or executor.",
+      "subject_types": ["report_schedule"],
+      "object": {"kind": "entity", "parameters": ["person"]},
+      "render": "{subject} is delivered to {object}"
+    },
+    "ranking_metric": {
+      "description": "The specific metric for a source-scoped ranking, not ownership of an agency/client metric.",
+      "subject_types": ["ranking_specification"],
+      "object": {"kind": "code", "parameters": ["form_fills", "ctr"]},
+      "render": "{subject} is ranked by {object}"
+    },
+    "owned_by": {
+      "description": "Explicit ownership of the referenced platform account, not page access, tenant access, management or authorship. Preserve the named reporter of reported ownership.",
+      "subject_types": ["platform_account"],
+      "object": {"kind": "entity", "parameters": ["organization"]},
+      "render": "{subject} is owned by {object}"
+    },
+    "monthly_budget": {
+      "description": "Explicit total monthly budget or monthly target spend, including a separate Timeframe: Month field; never a delta, predicted spend or multi-month total. Retain amount and month when currency is unstated using currency_symbol:null. Dollar symbols do not imply USD.",
+      "subject_types": ["budget_plan"],
+      "object": {"kind": "money"},
+      "render": "{subject} has monthly budget {object}"
+    },
+    "ramp_duration": {
+      "description": "Explicit duration of the scoped plan's ramp; separate from budget amount.",
+      "subject_types": ["budget_plan"],
+      "object": {"kind": "duration"},
+      "render": "{subject} has ramp duration {object}"
+    },
+    "operational_status": {
+      "description": "Status of scoped advertising activity or tracking, never the provider organization. Live status may also be an explicit conditional prerequisite.",
+      "subject_types": ["campaign_activity", "tracking_configuration"],
+      "object": {"kind": "code", "parameters": ["paused", "live", "blocked", "missing", "active"]},
+      "render": "{subject} has operational status {object}"
+    },
+    "executor": {
+      "description": "The actor who performs or is explicitly assigned/committed to perform this action. Merely proposing, requesting, reporting or discussing work does not make that actor its executor. A software_user is an opaque source account, never an inferred person. Retain explicit actors even for target-only action kinds.",
+      "subject_types": ["action"],
+      "object": {"kind": "entity", "parameters": ["person", "software_user"]},
+      "render": "{subject} has executor {object}"
+    },
+    "recipient": {
+      "description": "Explicit recipient of a complete action; a person or organization, never an inferred tenant.",
+      "subject_types": ["action"],
+      "object": {"kind": "entity", "parameters": ["person", "organization", "software_user"]},
+      "render": "{subject} has recipient {object}"
+    },
+    "target": {
+      "description": "Specific core target of an action; it must also satisfy that action kind's target types. A bare unknown purpose is not a target.",
+      "subject_types": ["action"],
+      "object": {"kind": "entity", "parameters": ["document", "report_schedule", "platform_account", "campaign_activity", "tracking_configuration", "incident", "action", "workspace", "artist_profile", "workflow", "software_user", "collection", "platform_page", "access_grant"]},
+      "render": "{subject} targets {object}"
+    },
+    "hours_worked": {
+      "description": "Explicit hours for the source-defined work period. Preserve the anchored period and unresolved worker; do not invent a year or tenant owner.",
+      "subject_types": ["work_period"],
+      "object": {"kind": "quantity", "parameters": {"unit": "hour"}},
+      "render": "{subject} has worked time {object}"
+    },
+    "billing_status": {
+      "description": "Explicit billed/unbilled status for the source-defined hours/period. Doing billing now is not proof it has completed.",
+      "subject_types": ["work_period"],
+      "object": {"kind": "code", "parameters": ["billed", "unbilled"]},
+      "render": "{subject} has billing status {object}"
+    },
+    "initial_spend": {
+      "description": "Explicit initial spend on the scoped campaign and source-defined period, not a budget or forecast.",
+      "subject_types": ["campaign_activity"],
+      "object": {"kind": "money_amount"},
+      "render": "{subject} has initial spend {object}"
+    },
+    "conversion_count": {
+      "description": "Explicit conversion count for the scoped campaign/source period. No conversions means zero, not unknown.",
+      "subject_types": ["campaign_activity"],
+      "object": {"kind": "quantity", "parameters": {"unit": "conversion"}},
+      "render": "{subject} has conversion count {object}"
+    },
+    "predicted_spend": {
+      "allowed_modes": ["hypothetical", "planned"],
+      "description": "Explicit predicted spend/forecast, separate from target budget and actual spend. Use hypothetical or planned mode, never asserted actual spend.",
+      "subject_types": ["budget_plan"],
+      "object": {"kind": "money_amount"},
+      "render": "{subject} forecasts spend {object}"
+    },
+    "rank_position": {
+      "description": "Explicit rank of a source-defined chart entry. Preserve the scoped chart/period; do not imply the rank is current.",
+      "subject_types": ["ranking_entry"],
+      "object": {"kind": "quantity", "parameters": {"unit": "rank"}},
+      "render": "{subject} has rank {object}"
+    },
+    "access_level": {
+      "description": "Source-scoped partial/full/blocked permission grant, not ownership. Different source stages must remain distinct.",
+      "subject_types": ["access_grant"],
+      "object": {"kind": "code", "parameters": ["partial", "full", "blocked"]},
+      "render": "{subject} has access level {object}"
+    },
+    "granted_to": {
+      "description": "Explicit grantee of the scoped access grant, not an owner or administrator by inference.",
+      "subject_types": ["access_grant"],
+      "object": {"kind": "entity", "parameters": ["person", "organization"]},
+      "render": "{subject} is granted to {object}"
+    },
+    "access_target": {
+      "description": "The specific page/account/workspace covered by the scoped access grant.",
+      "subject_types": ["access_grant"],
+      "object": {"kind": "entity", "parameters": ["platform_page", "platform_account", "workspace"]},
+      "render": "{subject} gives access to {object}"
+    },
+    "artifact_status": {
+      "description": "Explicit existence or absence of a scoped artifact/profile. An instruction to create it does not prove it exists.",
+      "subject_types": ["artist_profile", "platform_page", "document", "workspace"],
+      "object": {"kind": "code", "parameters": ["exists", "absent"]},
+      "render": "{subject} has existence status {object}"
+    },
+    "workflow_owned_by": {
+      "description": "Explicit responsibility for a source-scoped workflow; distinct from ownership of an advertising account.",
+      "subject_types": ["workflow"],
+      "object": {"kind": "entity", "parameters": ["person", "organization"]},
+      "render": "{subject} is owned by {object}"
+    }
   },
   "action_requirements": {
-    "send": {"required_roles": ["executor", "target", "recipient"], "target_types": ["document", "report_schedule"], "verb_forms": ["send", "sending", "sent", "post", "posted", "email", "emails"]},
-    "update": {"required_roles": ["executor", "target"], "target_types": ["platform_account", "campaign_activity", "tracking_configuration", "workflow", "document", "workspace"], "verb_forms": ["update", "updated", "change", "changed", "rebuild", "rebuilt"]},
-    "investigate": {"required_roles": ["executor", "target"], "target_types": ["incident", "action", "tracking_configuration", "platform_account", "platform_page", "access_grant", "software_user"], "verb_forms": ["investigate", "investigating", "troubleshoot", "explore"]},
-    "create": {"required_roles": ["target"], "target_types": ["artist_profile", "workspace", "document", "workflow", "collection"], "verb_forms": ["create", "build", "prepare"]},
-    "maintain": {"required_roles": ["target"], "target_types": ["workspace", "collection", "document", "workflow"], "verb_forms": ["maintain", "clean", "organize"]},
-    "review": {"required_roles": ["target"], "target_types": ["document", "workspace", "workflow", "software_user", "incident", "access_grant"], "verb_forms": ["review", "reviewed", "verify", "confirm"]},
-    "share_access": {"required_roles": ["target"], "target_types": ["workspace", "platform_account", "platform_page", "access_grant"], "verb_forms": ["share", "provide", "grant"]}
+    "send": {"required_roles": ["executor", "target", "recipient"], "target_types": ["document", "report_schedule"]},
+    "update": {"required_roles": ["executor", "target"], "target_types": ["platform_account", "campaign_activity", "tracking_configuration", "workflow", "document", "workspace"]},
+    "investigate": {"required_roles": ["executor", "target"], "target_types": ["incident", "action", "tracking_configuration", "platform_account", "platform_page", "access_grant", "software_user"]},
+    "create": {"required_roles": ["target"], "target_types": ["artist_profile", "workspace", "document", "workflow", "collection"]},
+    "maintain": {"required_roles": ["target"], "target_types": ["workspace", "collection", "document", "workflow"]},
+    "review": {"required_roles": ["target"], "target_types": ["document", "workspace", "workflow", "software_user", "incident", "access_grant"]},
+    "share_access": {"required_roles": ["target"], "target_types": ["workspace", "platform_account", "platform_page", "access_grant"]}
   }
 }

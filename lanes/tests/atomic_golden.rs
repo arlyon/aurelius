@@ -137,7 +137,7 @@ fn check_schema(value: &Value) {
     }
 }
 #[test]
-fn synthetic_source_goldens_cover_every_initial_predicate() -> Result<()> {
+fn synthetic_contract_examples_cover_every_initial_predicate() -> Result<()> {
     let registry = registry()?;
     registry.validate()?;
     let cases = cases()?;
@@ -155,7 +155,28 @@ fn synthetic_source_goldens_cover_every_initial_predicate() -> Result<()> {
             .map(|a| a.assertion.predicate.clone())
             .collect::<Vec<_>>();
         actual.sort();
-        let mut expected = case["expected"]
+        // These fixtures intentionally contain bad model interpretations. Their source labels
+        // remain unchanged; the structural validator must not claim to adjudicate their meaning.
+        let semantic_only = matches!(
+            case["name"].as_str().unwrap(),
+            "outer_negation_review"
+                | "total_is_not_monthly"
+                | "duration_digit_boundary"
+                | "unsupported_money_scale_not_truncated"
+                | "timezone_not_invented"
+        );
+        let structural_expected = case["facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["predicate"].clone())
+            .collect::<Vec<_>>();
+        let expected_value = if semantic_only {
+            Value::Array(structural_expected)
+        } else {
+            case["expected"].clone()
+        };
+        let mut expected = expected_value
             .as_array()
             .unwrap()
             .iter()
@@ -165,7 +186,11 @@ fn synthetic_source_goldens_cover_every_initial_predicate() -> Result<()> {
         assert_eq!(actual, expected, "{}", case["name"]);
         assert_eq!(
             graph.review_items.len(),
-            case["reviews"].as_u64().unwrap() as usize,
+            if semantic_only {
+                0
+            } else {
+                case["reviews"].as_u64().unwrap() as usize
+            },
             "{}",
             case["name"]
         );
@@ -465,7 +490,8 @@ fn native_review_identifiers_and_money_punctuation_match_the_contract() -> Resul
     Ok(())
 }
 #[test]
-fn reporting_hypotheses_require_exact_source_reporter_without_autofill() -> Result<()> {
+fn attribution_is_model_interpretation_with_reference_integrity_not_speech_heuristics() -> Result<()>
+{
     let mut case = cases()?
         .into_iter()
         .find(|c| c["name"] == "reported_ownership")
@@ -475,26 +501,22 @@ fn reporting_hypotheses_require_exact_source_reporter_without_autofill() -> Resu
     let catalog = p.span_catalog(&c)?;
     let registry = registry()?;
     assert!(
-        catalog.requires_attribution(
-            body["assertions"][0]["evidence"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|v| v.as_str().unwrap().to_owned())
-                .collect::<Vec<_>>()
-                .as_slice()
-        )
+        serde_json::to_value(&catalog)?
+            .get("attribution_hypotheses")
+            .is_none()
     );
     body["assertions"][0]["qualification"]["attribution"] = json!([]);
-    let rejected = atomic::validate(&body.to_string(), &catalog, &registry)?;
-    assert!(rejected.assertions.is_empty());
-    assert_eq!(
-        rejected.review_items[0].reason,
-        atomic::Reason::MissingAttribution
-    );
+    let unqualified = atomic::validate(&body.to_string(), &catalog, &registry)?;
+    assert_eq!(unqualified.assertions.len(), 1);
     body["assertions"][0]["qualification"]["attribution"] = json!([{"ref":"j"}]);
     let accepted = atomic::validate(&body.to_string(), &catalog, &registry)?;
     assert_eq!(accepted.assertions.len(), 1);
+    body["assertions"][0]["qualification"]["attribution"] = json!([{"ref":"not_declared"}]);
+    assert!(
+        atomic::validate(&body.to_string(), &catalog, &registry)?
+            .assertions
+            .is_empty()
+    );
     Ok(())
 }
 #[test]
@@ -524,7 +546,8 @@ fn task_title_requests_do_not_become_completed_business_actions() -> Result<()> 
     Ok(())
 }
 #[test]
-fn typed_values_cannot_drop_negation_units_or_forecast_mode() -> Result<()> {
+fn source_semantics_are_not_lexical_vetoes_but_declared_units_and_modes_are_checked() -> Result<()>
+{
     let cases = cases()?;
     let registry = registry()?;
     for (name, index, value) in [
@@ -535,11 +558,9 @@ fn typed_values_cannot_drop_negation_units_or_forecast_mode() -> Result<()> {
         let (c, p, mut body) = fixture(case)?;
         body["assertions"][index]["object"]["value"] = json!(value);
         let g = atomic::validate(&body.to_string(), &p.span_catalog(&c)?, &registry)?;
-        assert!(
-            g.review_items
-                .iter()
-                .any(|r| r.reason == atomic::Reason::InvalidTarget)
-        );
+        // Structurally valid but semantically wrong model output is not made true by this pass.
+        assert_eq!(g.assertions.len(), case["facts"].as_array().unwrap().len());
+        assert!(g.review_items.is_empty());
     }
     let case = cases
         .iter()
@@ -557,6 +578,43 @@ fn typed_values_cannot_drop_negation_units_or_forecast_mode() -> Result<()> {
     let (c, p, mut body) = fixture(case)?;
     body["assertions"][1]["object"]["unit"] = json!("hour");
     assert!(atomic::validate(&body.to_string(), &p.span_catalog(&c)?, &registry).is_err());
+    Ok(())
+}
+#[test]
+fn natural_language_variants_are_not_rejected_by_word_or_currency_whitelists() -> Result<()> {
+    let registry = registry()?;
+    let cases = [
+        json!({"source":"Monthly allowance\nAllocate eight thousand dollars each month.","entities":[["b","budget_plan","Monthly allowance",null]],"facts":[{"subject":"b","predicate":"monthly_budget","object":{"kind":"money","amount":"8000","currency_symbol":"$","period":"month"},"mode":"required","quote":"Allocate eight thousand dollars each month."}]}),
+        json!({"source":"Minutes\nI have the notes from our call.","entities":[["d","document","Minutes",null]],"facts":[{"subject":"d","predicate":"artifact_status","object":{"kind":"code","value":"exists"},"mode":"asserted","quote":"I have the notes from our call."}]}),
+        json!({"source":"Artist presence\nStatus: CONFIRMED GAP. No artist page is available.","verbs":["CONFIRMED"],"entities":[["p","artist_profile","Artist presence",null]],"facts":[{"subject":"p","predicate":"artifact_status","object":{"kind":"code","value":"absent"},"mode":"asserted","quote":"Status: CONFIRMED GAP. No artist page is available."}]}),
+        json!({"source":"Minutes\nMira should forward this to Ada.","verbs":["forward"],"entities":[["d","document","Minutes",null],["m","person","Mira",null],["r","person","Ada",null],["a","action","Mira should forward this to Ada.","send"]],"facts":[{"subject":"a","predicate":"executor","object":{"kind":"entity","ref":"m"},"mode":"required","quote":"Mira should forward this to Ada."},{"subject":"a","predicate":"recipient","object":{"kind":"entity","ref":"r"},"mode":"required","quote":"Mira should forward this to Ada."},{"subject":"a","predicate":"target","object":{"kind":"entity","ref":"d"},"mode":"required","quote":"Mira should forward this to Ada."}]}),
+    ];
+    for case in cases {
+        let (chunk, prepared, body) = fixture(&case)?;
+        let graph = atomic::validate(
+            &body.to_string(),
+            &prepared.span_catalog(&chunk)?,
+            &registry,
+        )?;
+        assert_eq!(
+            graph.assertions.len(),
+            case["facts"].as_array().unwrap().len()
+        );
+        assert!(graph.review_items.is_empty());
+    }
+    let serialized = serde_json::to_value(&registry)?;
+    assert!(serialized.get("facet_forms").is_none());
+    assert!(
+        serialized["action_requirements"]["send"]
+            .get("verb_forms")
+            .is_none()
+    );
+    assert!(
+        serialized["predicates"]["hours_worked"]["object"]["parameters"]
+            .get("aliases")
+            .is_none()
+    );
+    assert!(serialized["predicates"]["artifact_status"]["object"]["parameters"].is_array());
     Ok(())
 }
 #[test]

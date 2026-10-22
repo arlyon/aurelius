@@ -320,6 +320,23 @@ impl<'a> Preparation<'a> {
             )?,
         })
     }
+    #[cfg(feature = "postgres")]
+    pub(crate) fn warmup(&mut self) -> Result<()> {
+        if self.runtime.is_none() {
+            self.runtime = Some(Arc::new(LanguageRuntime::load(
+                self.config
+                    .language
+                    .as_ref()
+                    .context("language configuration required")?
+                    .clone(),
+            )?));
+        }
+        Ok(())
+    }
+    #[cfg(feature = "postgres")]
+    pub(crate) fn clear_document_cache(&mut self) {
+        self.language.clear();
+    }
     pub(crate) async fn prepare(&mut self, record: &LabRecord) -> Result<PreparedFactSource> {
         let policy = self
             .config
