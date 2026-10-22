@@ -22,6 +22,7 @@ pub mod mail;
 pub mod notification;
 pub mod notion;
 pub mod ontology;
+pub mod open_claims_prototype;
 pub mod postgres;
 pub mod provider_metadata;
 pub mod quality;
