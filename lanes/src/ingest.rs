@@ -606,7 +606,7 @@ mod runtime {
                         if record.deleted {
                             TransformResult::Ignored
                         } else {
-                            TransformResult::Ready(mail::conversation(record, &self.xberg).await?)
+                            mail::project(record, &self.xberg).await?
                         }
                     }
                     Normalizer::Notion | Normalizer::File => unreachable!(),

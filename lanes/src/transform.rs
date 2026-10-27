@@ -11,6 +11,7 @@ use std::{
 pub enum DeferredReason {
     MissingThreadRoot,
     MissingTask,
+    NoReadableMailContent,
 }
 
 #[derive(Clone, Debug)]

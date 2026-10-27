@@ -672,7 +672,7 @@ impl LaneActivities for LaneEngine {
                         if record.deleted {
                             TransformResult::Ignored
                         } else {
-                            TransformResult::Ready(mail::conversation(record, &self.xberg).await?)
+                            mail::project(record, &self.xberg).await?
                         }
                     }
                     Normalizer::Notion => anyhow::bail!("Notion projection requires PG ingestion"),

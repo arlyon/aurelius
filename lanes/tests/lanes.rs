@@ -461,6 +461,38 @@ async fn mail_thread_orders_messages_decodes_charsets_and_preserves_attachment_g
     );
     record.data["messages"][0]["threadId"] = json!("foreign-thread");
     assert!(mail::conversation(&record, &xberg).await.is_err());
+    for payload in [
+        json!({"mimeType":"text/plain"}),
+        json!({"mimeType":"text/plain","body":{"data":""}}),
+        json!({"mimeType":"text/plain","body":{"data":encode(b"  \n ")}}),
+        json!({"mimeType":"application/pdf","filename":"missing.pdf","body":{"attachmentId":"unavailable"}}),
+    ] {
+        record.data = json!({"id":"thread","messages":[message("empty","4000",payload)]});
+        assert!(matches!(
+            mail::project(&record, &xberg).await?,
+            aurelius_lanes::transform::TransformResult::Deferred(
+                aurelius_lanes::transform::DeferredReason::NoReadableMailContent
+            )
+        ));
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "empty mail must not invoke extraction"
+    );
+    record.data = json!({"id":"thread","messages":[message("readable","5000",
+        json!({"mimeType":"text/plain","body":{"data":encode(b"Next readable mail")}}))]});
+    let aurelius_lanes::transform::TransformResult::Ready(next) =
+        mail::project(&record, &xberg).await?
+    else {
+        anyhow::bail!("readable mail after empty input was not indexable")
+    };
+    assert_eq!(next.sections[0].text, "Next readable mail");
+    record.deleted = true;
+    assert!(matches!(
+        mail::project(&record, &xberg).await?,
+        aurelius_lanes::transform::TransformResult::Ignored
+    ));
     server.abort();
     Ok(())
 }

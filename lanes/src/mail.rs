@@ -1,5 +1,6 @@
 use crate::{
     document::{CanonicalDocument, DocumentKind, Section, SourceRecord},
+    transform::{DeferredReason, TransformResult},
     xberg::XbergClient,
 };
 use anyhow::{Context, Result, ensure};
@@ -154,6 +155,19 @@ fn decode_text(part: &Part, bytes: &[u8]) -> Result<String> {
     let (text, _, errors) = encoding.decode(bytes);
     ensure!(!errors, "invalid mail text encoding");
     Ok(text.into_owned())
+}
+
+pub async fn project(record: &SourceRecord, xberg: &XbergClient) -> Result<TransformResult> {
+    if record.deleted {
+        return Ok(TransformResult::Ignored);
+    }
+    let document = conversation(record, xberg).await?;
+    if document.sections.is_empty() {
+        return Ok(TransformResult::Deferred(
+            DeferredReason::NoReadableMailContent,
+        ));
+    }
+    Ok(TransformResult::Ready(document))
 }
 
 pub async fn conversation(record: &SourceRecord, xberg: &XbergClient) -> Result<CanonicalDocument> {
