@@ -5,32 +5,61 @@ use crate::{
     },
 };
 use anyhow::Result;
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use temporalio_common::RetryPolicy;
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
     ActivityExecutionError, ActivityOptions, ApplicationFailure, WorkflowContext, WorkflowResult,
     activities::{ActivityContext, ActivityError},
 };
+use tracing::Instrument;
 
 pub struct LaneWorker(pub LaneEngine);
 pub(crate) async fn activity<T>(
     ctx: ActivityContext,
     work: impl Future<Output = Result<T>>,
 ) -> Result<T, ActivityError> {
-    tokio::pin!(work);
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
-    loop {
-        tokio::select! {
-            _=ctx.cancelled()=>return Err(ActivityError::cancelled()),
-            result=&mut work=>return result.map_err(|error| {
-                let code=crate::ingest::failure_code(&error);
-                tracing::warn!(failure_code=%code,"lane activity failed");
-                ActivityError::from(anyhow::anyhow!("lane activity failed ({code})"))
-            }),
-            _=heartbeat.tick()=>ctx.record_heartbeat(()).await?,
+    let info = ctx.info();
+    let span = tracing::info_span!(
+        "lane_activity",
+        workflow_id = info.workflow_id.as_deref().unwrap_or(""),
+        run_id = info.workflow_run_id.as_deref().unwrap_or(""),
+        activity_id = %info.activity_id,
+        activity_type = %info.activity_type,
+        attempt = info.attempt
+    );
+    async move {
+        let started = Instant::now();
+        tracing::info!("lane activity started");
+        let result = async move {
+            tokio::pin!(work);
+            let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
+            loop {
+                tokio::select! {
+                    _=ctx.cancelled()=>return Err(ActivityError::cancelled()),
+                    result=&mut work=>return result.map_err(|error| {
+                        let code=crate::ingest::failure_code(&error);
+                        tracing::warn!(failure_code=%code,"lane activity failed");
+                        ActivityError::from(anyhow::anyhow!("lane activity failed ({code})"))
+                    }),
+                    _=heartbeat.tick()=>ctx.record_heartbeat(()).await?,
+                }
+            }
         }
+        .await;
+        tracing::info!(
+            elapsed_ms = started.elapsed().as_millis(),
+            outcome = if result.is_ok() { "complete" } else { "failed" },
+            "lane activity finished"
+        );
+        result
     }
+    .instrument(span)
+    .await
 }
 #[activities]
 impl LaneWorker {
