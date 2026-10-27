@@ -2,6 +2,7 @@
 
 mod cli;
 mod ingest;
+mod lemonade;
 mod metabolic;
 mod persistence;
 mod query;
@@ -11,6 +12,7 @@ use clap::Parser;
 use cli::{Cli, Commands, ModelSpec};
 use ingest::extract_facts::run_extract_facts;
 use ingest::pipeline::run_ingest;
+use lemonade::LemonadeConfig;
 use metabolic::dream::run_dream;
 use query::facts::run_facts;
 use query::ls::run_ls;
@@ -18,7 +20,7 @@ use query::search::run_search;
 use query::teach::run_teach;
 use query::today::run_today;
 use swiftide::traits::{ChatCompletion, EmbeddingModel};
-use swiftide_integrations::{lemonade::config::LemonadeConfig, ollama::config::OllamaConfig};
+use swiftide_integrations::{ollama::config::OllamaConfig, openai::GenericOpenAIBuilder};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
@@ -40,12 +42,12 @@ fn build_embedder(
             Ok(Box::new(b.build()?))
         }
         ModelSpec::Lemonade(model) => {
-            let mut b = swiftide_integrations::lemonade::Lemonade::builder();
+            let mut b = GenericOpenAIBuilder::<LemonadeConfig>::default();
             b.default_embed_model(model);
             if let Some(url) = lemonade_url {
                 use async_openai::Client;
                 b.client(Client::<LemonadeConfig>::with_config(
-                    LemonadeConfig::builder().api_base(url).build()?,
+                    LemonadeConfig::default().with_api_base(url),
                 ));
             }
             Ok(Box::new(b.build()?))
@@ -71,12 +73,12 @@ fn build_chat(
             Ok(Box::new(b.build()?))
         }
         ModelSpec::Lemonade(model) => {
-            let mut b = swiftide_integrations::lemonade::Lemonade::builder();
+            let mut b = GenericOpenAIBuilder::<LemonadeConfig>::default();
             b.default_prompt_model(model);
             if let Some(url) = lemonade_url {
                 use async_openai::Client;
                 b.client(Client::<LemonadeConfig>::with_config(
-                    LemonadeConfig::builder().api_base(url).build()?,
+                    LemonadeConfig::default().with_api_base(url),
                 ));
             }
             Ok(Box::new(b.build()?))

@@ -188,7 +188,8 @@ pub async fn write_facts(table: &lancedb::table::Table, facts: &[Fact]) -> Resul
         ],
     )?;
 
-    table.add(vec![batch]).execute().await?;
+    let batches = arrow_array::RecordBatchIterator::new(std::iter::once(Ok(batch)), schema);
+    table.add(batches).execute().await?;
     Ok(())
 }
 

@@ -444,7 +444,9 @@ impl NodeCache for Cache {
             )
             .unwrap();
 
-            let _ = self.cache_table.add(vec![batch]).execute().await;
+            let schema = batch.schema();
+            let batches = arrow_array::RecordBatchIterator::new(std::iter::once(Ok(batch)), schema);
+            let _ = self.cache_table.add(batches).execute().await;
         }
     }
 }
