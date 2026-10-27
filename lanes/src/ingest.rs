@@ -40,9 +40,10 @@ pub fn failure_code(error: &anyhow::Error) -> String {
         .chain()
         .find_map(|e| e.downcast_ref::<reqwest::Error>());
     format!(
-        "stage={stage} http_status={} timeout={}",
+        "stage={stage} http_status={} timeout={} postgres_code={}",
         http.and_then(|e| e.status()).map_or(0, |s| s.as_u16()),
-        http.is_some_and(|e| e.is_timeout())
+        http.is_some_and(|e| e.is_timeout()),
+        crate::postgres::database_failure_code(error).unwrap_or("none")
     )
 }
 

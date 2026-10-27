@@ -122,25 +122,6 @@ mod runtime {
         config: Config,
         profiles: BTreeMap<String, Vec<String>>,
     }
-    fn extraction_profile(config: &Config, base: &str) -> Result<String> {
-        if let Some(policy) = &config.fact_quality {
-            #[cfg(feature = "language")]
-            return policy.profile(
-                base,
-                &crate::fact_preparation::FactPreparer::profile_for(config)?,
-            );
-            #[cfg(not(feature = "language"))]
-            {
-                let _ = policy;
-                anyhow::bail!("typed fact extraction requires the language build feature");
-            }
-        }
-        ensure!(
-            config.language.is_none() && config.fact_context.is_none(),
-            "fact preparation configured without a typed quality policy; refusing legacy extraction fallback"
-        );
-        Ok(base.into())
-    }
     impl FactEngine {
         pub async fn new(config: Config) -> Result<Self> {
             let sink = PostgresSink::connect(
@@ -192,7 +173,7 @@ mod runtime {
                 "background facts require an authenticated gateway"
             );
             let extractor = ChatExtractor::new(chat, config.ontology.clone())?;
-            let profile = extraction_profile(&config, &extractor.profile)?;
+            let profile = config.extraction_profile()?;
             #[cfg(feature = "language")]
             let preparer = if config.fact_quality.is_some() {
                 Some(crate::fact_preparation::FactPreparer::with_sink(
@@ -244,8 +225,7 @@ mod runtime {
                 chat.gateway.is_some(),
                 "background facts require an authenticated gateway"
             );
-            let extractor = ChatExtractor::new(chat, config.ontology.clone())?;
-            let profile = extraction_profile(config, &extractor.profile)?;
+            let profile = config.extraction_profile()?;
             let scopes: std::collections::BTreeSet<_> = config
                 .lanes
                 .values()
@@ -367,12 +347,36 @@ mod runtime {
                     receipt.review_windows += 1;
                     continue;
                 }
-                match self
-                    .extractor
-                    .extract_quality(&chunk, &prepared, policy, &self.profile)
-                    .await
-                {
-                    Ok(graph) => {
+                let stored = async {
+                    if policy.format == crate::quality::ExtractionFormat::OpenClaimsV3 {
+                        let extracted = self
+                            .extractor
+                            .extract_open_claims(&chunk, &prepared, policy)
+                            .await?;
+                        self.sink
+                            .write_open_claims_candidates(
+                                &chunk,
+                                &extracted,
+                                &prepared,
+                                &self.extractor.profile,
+                                policy,
+                            )
+                            .await?;
+                        let claims = extracted.graph["claims"]
+                            .as_array()
+                            .context("validated open claims missing")?
+                            .len();
+                        let rejected = ["claims", "unresolved"].into_iter().any(|kind| {
+                            extracted.graph["rejected"][kind]
+                                .as_array()
+                                .is_some_and(|items| !items.is_empty())
+                        });
+                        Ok::<_, anyhow::Error>((claims, rejected))
+                    } else {
+                        let graph = self
+                            .extractor
+                            .extract_quality(&chunk, &prepared, policy, &self.profile)
+                            .await?;
                         self.sink
                             .write_quality_candidates(
                                 &chunk,
@@ -382,9 +386,15 @@ mod runtime {
                                 policy,
                             )
                             .await?;
+                        Ok((graph.candidates.len(), !graph.rejections.is_empty()))
+                    }
+                }
+                .await;
+                match stored {
+                    Ok((claims, rejected)) => {
                         receipt.stored_windows += 1;
-                        receipt.new_claims += graph.candidates.len();
-                        if !graph.rejections.is_empty() {
+                        receipt.new_claims += claims;
+                        if rejected {
                             self.sink
                                 .record_fact_status(
                                     &source.request.scope,

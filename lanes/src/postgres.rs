@@ -9,10 +9,40 @@ pub struct PostgresConfig {
     pub artifacts_table: String,
     pub chunks_table: String,
     pub tenant_setting: Option<String>,
+    #[serde(default = "default_pool_size")]
+    pub pool_size: u32,
+}
+fn default_pool_size() -> u32 {
+    2
+}
+#[derive(Debug)]
+struct DatabaseFailure {
+    code: String,
+}
+impl std::fmt::Display for DatabaseFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Postgres operation failed ({}); database details withheld",
+            self.code
+        )
+    }
+}
+impl std::error::Error for DatabaseFailure {}
+pub(crate) fn database_failure_code(error: &anyhow::Error) -> Option<&str> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<DatabaseFailure>()
+            .map(|failure| failure.code.as_str())
+    })
 }
 impl PostgresConfig {
     pub fn validate(&self) -> Result<()> {
         crate::config::validate_env_name(&self.url_env)?;
+        ensure!(
+            (1..=4).contains(&self.pool_size),
+            "invalid Postgres pool size"
+        );
         for name in [&self.schema, &self.artifacts_table, &self.chunks_table] {
             quote_identifier(name)?;
         }
@@ -54,7 +84,7 @@ pub(crate) fn quote_identifier(name: &str) -> Result<String> {
 mod driver {
     use super::*;
     use crate::{document::CanonicalDocument, indexing::IndexedDocument};
-    use anyhow::{Context, anyhow};
+    use anyhow::Context;
     use serde_json::json;
     use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction, postgres::PgPoolOptions};
     use std::{
@@ -95,12 +125,30 @@ mod driver {
     }
 
     fn database_error(error: sqlx::Error) -> anyhow::Error {
-        let code = error
-            .as_database_error()
-            .and_then(|e| e.code())
-            .map(|c| c.into_owned())
-            .unwrap_or_else(|| "transport".into());
-        anyhow!("Postgres operation failed ({code}); database details withheld")
+        let code = match &error {
+            sqlx::Error::PoolTimedOut => "pool_timeout".into(),
+            sqlx::Error::PoolClosed => "pool_closed".into(),
+            _ => error
+                .as_database_error()
+                .and_then(|e| e.code())
+                .filter(|code| {
+                    code.len() == 5
+                        && code
+                            .bytes()
+                            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+                })
+                .map(|code| code.into_owned())
+                .unwrap_or_else(|| "transport".into()),
+        };
+        DatabaseFailure { code }.into()
+    }
+    #[test]
+    fn pool_failure_diagnostics_never_retain_private_driver_details() {
+        let error = database_error(sqlx::Error::Protocol("PRIVATE_DATABASE_SECRET".into()));
+        assert_eq!(super::database_failure_code(&error), Some("transport"));
+        assert!(!format!("{error:#}").contains("PRIVATE_DATABASE_SECRET"));
+        let error = database_error(sqlx::Error::PoolTimedOut);
+        assert_eq!(super::database_failure_code(&error), Some("pool_timeout"));
     }
     impl PostgresSink {
         pub async fn connect(config: PostgresConfig, dimensions: usize) -> Result<Self> {
@@ -110,7 +158,8 @@ mod driver {
                 "invalid embedding dimensions"
             );
             let pool = PgPoolOptions::new()
-                .max_connections(4)
+                .max_connections(config.pool_size)
+                .idle_timeout(Some(Duration::from_secs(60)))
                 .acquire_timeout(Duration::from_secs(15))
                 .connect(&crate::config::credential(&config.url_env)?)
                 .await
@@ -866,6 +915,55 @@ mod driver {
             self.write_candidate_artifact(&chunk, &profile, metadata)
                 .await
         }
+        pub async fn write_open_claims_candidates(
+            &self,
+            chunk: &crate::contracts::Chunk,
+            extracted: &crate::facts::OpenClaimsExtraction,
+            prepared: &crate::fact_preparation::PreparedFactSource,
+            base_profile: &str,
+            policy: &crate::quality::QualityConfig,
+        ) -> Result<String> {
+            ensure!(
+                policy.format == crate::quality::ExtractionFormat::OpenClaimsV3,
+                "open-claims policy required"
+            );
+            let request = crate::open_claims_prototype::prepare_compact(
+                chunk,
+                prepared,
+                base_profile,
+                policy.max_output_tokens.unwrap_or(4096),
+            )?;
+            let profile = policy.profile(base_profile, &prepared.preparation_profile)?;
+            ensure!(
+                extracted.profile == profile
+                    && extracted.request.binding == request.binding
+                    && extracted.request.profile == request.profile,
+                "open candidate request/profile mismatch"
+            );
+            let checked = crate::open_claims_prototype::validate_partial(
+                &extracted.raw_output,
+                chunk,
+                &request,
+            )?;
+            ensure!(
+                checked == extracted.graph,
+                "open candidate graph validation failed"
+            );
+            let metadata = json!({"status":"candidate", "profile":profile,
+                "protocol_profile":request.profile,
+                "contract_version":crate::open_claims_prototype::COMPACT_VERSION,
+                "validation_policy":crate::open_claims_prototype::CLAIM_LOCAL_POLICY,
+                "source_artifact_id":chunk.document.key.source,
+                "source_revision":chunk.document.key.revision,"source_range":chunk.range,
+                "source_content_hash":chunk.document.content_hash(),
+                "request_binding":request.binding,"candidate_graph":checked,
+                "generation":extracted.raw_output,"usage":extracted.usage,
+                "preparation_profile":prepared.preparation_profile,
+                "canonical_context":prepared.canonical_context,
+                "provider_layout":prepared.provider_header,"chunk_count":0});
+            self.write_candidate_artifact(chunk, &profile, metadata)
+                .await
+        }
         pub async fn write_quality_candidates(
             &self,
             chunk: &crate::contracts::Chunk,
@@ -1110,6 +1208,34 @@ pub use driver::{ExtractionInput, FactManifestEntry, PostgresSink, StoredDocumen
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pool_size_is_bounded_and_defaults_to_two() {
+        let mut config: PostgresConfig = serde_json::from_value(serde_json::json!({
+            "url_env":"DATABASE_URL", "schema":"public", "artifacts_table":"artifacts",
+            "chunks_table":"chunks"
+        }))
+        .unwrap();
+        assert_eq!(config.pool_size, 2);
+        for size in [1, 2, 4] {
+            config.pool_size = size;
+            config.validate().unwrap();
+        }
+        for size in [0, 5, u32::MAX] {
+            config.pool_size = size;
+            assert!(config.validate().is_err());
+        }
+    }
+    #[test]
+    fn sqlstate_survives_private_context_without_leaking_it() {
+        let error = anyhow::Error::new(DatabaseFailure {
+            code: "53300".into(),
+        })
+        .context("PRIVATE_QUERY_AND_CREDENTIAL");
+        assert_eq!(
+            crate::ingest::failure_code(&error),
+            "stage=unknown http_status=0 timeout=false postgres_code=53300"
+        );
+    }
     #[test]
     fn identifiers_are_quoted_not_interpolated_as_sql() {
         assert_eq!(

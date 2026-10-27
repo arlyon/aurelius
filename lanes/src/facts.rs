@@ -286,6 +286,15 @@ pub struct AtomicExtraction {
     pub raw_output: String,
     pub profile: String,
 }
+#[derive(Serialize)]
+pub struct OpenClaimsExtraction {
+    pub request: crate::open_claims_prototype::PreparedRequest,
+    pub graph: Value,
+    pub usage: Option<ExtractionUsage>,
+    #[serde(skip_serializing)]
+    pub raw_output: String,
+    pub profile: String,
+}
 pub fn review_diagnostic(error: &anyhow::Error) -> ReviewDiagnostic {
     error
         .downcast_ref::<ReviewDiagnostic>()
@@ -551,6 +560,60 @@ impl ChatExtractor {
             raw_output: output.text,
             profile: request.profile,
             binding: request.binding,
+        })
+    }
+    pub async fn extract_open_claims(
+        &self,
+        chunk: &Chunk,
+        prepared: &crate::fact_preparation::PreparedFactSource,
+        policy: &crate::quality::QualityConfig,
+    ) -> Result<OpenClaimsExtraction> {
+        ensure!(
+            matches!(self.api, ChatApi::Responses),
+            ReviewDiagnostic::NativeSchemaUnsupported
+        );
+        ensure!(
+            policy.format == crate::quality::ExtractionFormat::OpenClaimsV3,
+            "open-claims policy required"
+        );
+        policy.validate(&self.ontology)?;
+        let limit = policy.max_output_tokens.unwrap_or(4096);
+        let request =
+            crate::open_claims_prototype::prepare_compact(chunk, prepared, &self.profile, limit)
+                .context(ExtractionReview::Input)?;
+        let profile = policy.profile(&self.profile, &prepared.preparation_profile)?;
+        let format = json!({"type":"json_schema", "name":crate::open_claims_prototype::COMPACT_FORMAT_NAME,
+            "strict":true, "schema":request.schema});
+        let output = self
+            .complete_formatted(
+                chunk,
+                &request.prompt,
+                &request.input,
+                (
+                    &profile,
+                    crate::open_claims_prototype::COMPACT_VERSION,
+                    limit,
+                ),
+                Some(&format),
+            )
+            .await?;
+        let graph = crate::open_claims_prototype::validate_partial(&output.text, chunk, &request)
+            .map_err(|error| {
+                with_usage(
+                    self.with_output(
+                        error.context(ReviewDiagnostic::NativeSchemaViolation),
+                        &output.text,
+                    ),
+                    output.usage.as_ref(),
+                )
+            })
+            .context(ExtractionReview::Output)?;
+        Ok(OpenClaimsExtraction {
+            request,
+            graph,
+            usage: output.usage,
+            raw_output: output.text,
+            profile,
         })
     }
     async fn complete(
@@ -902,6 +965,142 @@ mod gateway_tests {
             _ => (),
         }
         Json(response)
+    }
+    #[tokio::test]
+    async fn production_open_claims_native_schema_keeps_valid_siblings_and_runtime_metadata()
+    -> Result<()> {
+        use crate::{
+            fact_context::FactContext, fact_preparation::PreparedFactSource,
+            language::LanguageAnalysis, open_claims_prototype as open, quality::QualityConfig,
+        };
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let document = Document {
+            key: DocumentKey {
+                scope: "tenant".into(),
+                source: "source".into(),
+                revision: "1".into(),
+            },
+            text: "Google Ads spent €150.".into(),
+            context: None,
+            metadata: Default::default(),
+        };
+        let language = LanguageAnalysis {
+            document: document.key.clone(),
+            content_hash: document.content_hash(),
+            profile: "a".repeat(64),
+            mentions: vec![],
+            coreference_hypotheses: vec![],
+            verb_spans: vec![],
+            number_spans: vec![],
+            sentence_spans: vec![],
+        };
+        let prepared = PreparedFactSource::from_analysis(
+            &document,
+            language,
+            vec![],
+            FactContext {
+                organization_id: "tenant".into(),
+                entities: vec![],
+            },
+            "2026-01-01T00:00:00Z".parse()?,
+            "b".repeat(64),
+        )?;
+        let chunk = Chunk {
+            range: ByteRange {
+                start: 0,
+                end: document.text.len(),
+            },
+            document,
+        };
+        let packet = open::prepare_compact(&chunk, &prepared, &"c".repeat(64), 4096)?;
+        let unit = packet
+            .units
+            .iter()
+            .find(|(_, s)| s.quote.contains("Google Ads"))
+            .unwrap()
+            .0;
+        let valid = json!({"subject":{"source":{"unit_ref":unit,"exact_quote":"Google Ads","context_quote":null},"type_hint":null},
+            "relation":"spent","object":{"source":{"unit_ref":unit,"exact_quote":"€150","context_quote":null},"type_hint":null},
+            "qualification":{"mode":"asserted","polarity":"positive","reported_by":[],"conditions":[],"temporal":[]},"evidence":[unit]});
+        let raw =
+            json!({"claims":[valid.clone(),{"unexpected":"invalid sibling"}],"unresolved":[]})
+                .to_string();
+        let response = json!({"status":"completed","usage":{"input_tokens":20,"output_tokens":30},
+            "output":[{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":raw}]}]});
+        let calls = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::new(Mutex::new(Value::Null));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let count = calls.clone();
+        let payload = captured.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/responses",
+                    post(move |headers: HeaderMap, Json(input): Json<Value>| {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        let metadata: Value =
+                            serde_json::from_str(headers["cf-aig-metadata"].to_str().unwrap())
+                                .unwrap();
+                        *payload.lock().unwrap() = json!({"body":input,"metadata":metadata});
+                        let response = response.clone();
+                        async move { Json(response) }
+                    }),
+                ),
+            )
+            .await
+        });
+        let ontology =
+            crate::config::Config::parse(include_str!("../tests/fixtures/business.toml"))?.ontology;
+        let extractor = ChatExtractor::with_credentials(
+            &ChatConfig {
+                endpoint: format!("http://{address}/responses"),
+                model: "gpt-6-luna".into(),
+                revision: "native-v1".into(),
+                api_key_env: None,
+                api: ChatApi::Responses,
+                gateway: Some(GatewayConfig {
+                    token_env: "FIXTURE_GATEWAY_TOKEN".into(),
+                    byok_alias: None,
+                }),
+                references: Default::default(),
+            },
+            ontology.clone(),
+            |_| Ok("fixture-only-token".into()),
+        )?;
+        let policy: QualityConfig = serde_json::from_value(json!({"format":"open_claims_v3",
+            "context_as_of":"2026-01-01T00:00:00Z","max_output_tokens":4096}))?;
+        let extracted = extractor
+            .extract_open_claims(&chunk, &prepared, &policy)
+            .await?;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let input = captured.lock().unwrap();
+        assert_eq!(
+            input["body"]["text"]["format"]["name"],
+            open::COMPACT_FORMAT_NAME
+        );
+        assert_eq!(input["body"]["text"]["format"]["strict"], true);
+        assert_eq!(input["body"]["max_output_tokens"], 4096);
+        assert_eq!(input["metadata"]["org_id"], "tenant");
+        assert_eq!(input["metadata"]["profile"], extracted.profile);
+        assert_eq!(extracted.graph["claims"].as_array().unwrap().len(), 1);
+        assert_eq!(extracted.graph["claims"][0]["claim"], valid);
+        assert_eq!(extracted.graph["rejected"]["claims"][0]["source_index"], 1);
+        assert_eq!(
+            extracted.graph["validation_policy"],
+            open::CLAIM_LOCAL_POLICY
+        );
+        assert_eq!(
+            extracted.profile,
+            policy.profile(&extractor.profile, &prepared.preparation_profile)?
+        );
+        assert_ne!(extracted.profile, extracted.request.profile);
+        server.abort();
+        Ok(())
     }
     #[test]
     fn credential_material_is_rejected_without_echoing_it() {

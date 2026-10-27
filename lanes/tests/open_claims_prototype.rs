@@ -512,6 +512,24 @@ fn compact_backend_binding_and_resource_security_checks_remain_fatal() -> Result
     Ok(())
 }
 #[test]
+fn runtime_mode_is_explicit_profiled_and_cannot_enable_typed_repairs() -> Result<()> {
+    use aurelius_lanes::{config::Config, quality::QualityConfig};
+    let ontology = Config::parse(include_str!("fixtures/business.toml"))?.ontology;
+    let mut policy: QualityConfig =
+        serde_json::from_value(json!({"context_as_of":"2026-01-01T00:00:00Z"}))?;
+    assert!(serde_json::to_value(&policy)?.get("format").is_none());
+    let legacy = policy.profile(&"c".repeat(64), &"b".repeat(64))?;
+    policy.format = aurelius_lanes::quality::ExtractionFormat::OpenClaimsV3;
+    policy.validate(&ontology)?;
+    let current = policy.profile(&"c".repeat(64), &"b".repeat(64))?;
+    assert_ne!(legacy, current);
+    policy.max_output_tokens = Some(2048);
+    assert_ne!(current, policy.profile(&"c".repeat(64), &"b".repeat(64))?);
+    policy.align_whitespace = true;
+    assert!(policy.validate(&ontology).is_err());
+    Ok(())
+}
+#[test]
 fn security_guard_and_window_boundaries_are_not_relaxed() -> Result<()> {
     let (chunk, prepared) = fixture("Header\napi_key=fixture_secret_value\n")?;
     assert!(open::prepare(&chunk, &prepared, &"c".repeat(64), 16384).is_err());

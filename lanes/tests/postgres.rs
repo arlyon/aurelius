@@ -28,6 +28,7 @@ fn config(schema: &str, artifacts: &str, chunks: &str) -> PostgresConfig {
         artifacts_table: artifacts.into(),
         chunks_table: chunks.into(),
         tenant_setting: Some("projection.scope".into()),
+        pool_size: 2,
     }
 }
 fn document(id: &str) -> IndexedDocument {

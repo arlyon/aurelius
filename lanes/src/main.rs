@@ -53,11 +53,8 @@ async fn main() -> Result<()> {
             for name in config.lanes.keys() {
                 println!("lane={name} profile={}", config.lane_request(name)?.profile);
             }
-            if let Some(chat) = &config.chat {
-                println!(
-                    "extraction_profile={}",
-                    ChatExtractor::profile_for(chat, &config.ontology)?
-                );
+            if config.chat.is_some() {
+                println!("extraction_profile={}", config.extraction_profile()?);
             }
         }
         #[cfg(all(feature = "postgres", feature = "temporal"))]

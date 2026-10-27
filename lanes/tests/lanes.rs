@@ -191,7 +191,7 @@ async fn failure_codes_withhold_response_urls_credentials_and_source_context() {
     let error = anyhow::Error::from(error).context("PRIVATE_DOCUMENT_TEXT");
     assert_eq!(
         aurelius_lanes::ingest::failure_code(&error),
-        "stage=unknown http_status=503 timeout=false"
+        "stage=unknown http_status=503 timeout=false postgres_code=none"
     );
     server.abort();
 }
@@ -507,6 +507,7 @@ fn lane_profile_tracks_semantics_not_database_names_or_service_locations() {
         artifacts_table: "records".into(),
         chunks_table: "pieces".into(),
         tenant_setting: None,
+        pool_size: 2,
     });
     assert_eq!(profile, config.lane_request("fixture").unwrap());
     config.embedding.as_mut().unwrap().revision = "r2".into();

@@ -30,9 +30,23 @@ pub struct PropertySpec {
     #[serde(default)]
     pub metadata_only: bool,
 }
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtractionFormat {
+    #[default]
+    Typed,
+    OpenClaimsV3,
+}
+impl ExtractionFormat {
+    fn is_typed(&self) -> bool {
+        *self == Self::Typed
+    }
+}
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct QualityConfig {
+    #[serde(default, skip_serializing_if = "ExtractionFormat::is_typed")]
+    pub format: ExtractionFormat,
     pub context_as_of: DateTime<Utc>,
     #[serde(default)]
     pub properties: BTreeMap<String, PropertySpec>,
@@ -71,6 +85,18 @@ fn name(value: &str) -> bool {
 impl QualityConfig {
     pub fn validate(&self, ontology: &Ontology) -> Result<()> {
         ontology.validate()?;
+        if self.format == ExtractionFormat::OpenClaimsV3 {
+            ensure!(
+                self.properties.is_empty()
+                    && self.extra_instructions.is_none()
+                    && !self.align_whitespace
+                    && !self.quote_anchors
+                    && !self.align_mentions
+                    && self.metadata_relations == provider_relations()
+                    && self.scope_review_relations == scope_review_relations(),
+                "open claims cannot mix typed vocabulary, custom prompts or quote repair policies"
+            );
+        }
         if let Some(limit) = self.max_output_tokens {
             ensure!(
                 (512..=16384).contains(&limit),
@@ -117,6 +143,18 @@ impl QualityConfig {
         Ok(())
     }
     pub fn profile(&self, base: &str, preparation: &str) -> Result<String> {
+        if self.format == ExtractionFormat::OpenClaimsV3 {
+            return Ok(blake3::hash(&serde_json::to_vec(&(
+                "open-claims-runtime-v1",
+                crate::open_claims_prototype::COMPACT_VERSION,
+                crate::open_claims_prototype::CLAIM_LOCAL_POLICY,
+                base,
+                preparation,
+                self,
+            ))?)
+            .to_hex()
+            .to_string());
+        }
         Ok(blake3::hash(&serde_json::to_vec(&(
             QUALITY_VERSION,
             PROMPT,

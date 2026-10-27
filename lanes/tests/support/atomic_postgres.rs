@@ -12,6 +12,87 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use std::collections::{BTreeMap, BTreeSet};
 
+async fn exercise_open_claims(
+    sink: &PostgresSink,
+    admin: &PgPool,
+    chunk: &Chunk,
+    prepared: &PreparedFactSource,
+) -> Result<()> {
+    use aurelius_lanes::{
+        facts::OpenClaimsExtraction, open_claims_prototype as open, quality::QualityConfig,
+    };
+    let base = "c".repeat(64);
+    let policy: QualityConfig = serde_json::from_value(json!({"format":"open_claims_v3",
+        "context_as_of":"2026-01-01T00:00:00Z","max_output_tokens":4096}))?;
+    let request = open::prepare_compact(chunk, prepared, &base, 4096)?;
+    let unit = request
+        .units
+        .iter()
+        .find(|(_, s)| s.quote.contains("$1500/month"))
+        .context("open budget unit")?
+        .0;
+    let raw=json!({"claims":[{
+        "subject":{"source":{"unit_ref":unit,"exact_quote":"Monthly budget","context_quote":null},"type_hint":null},
+        "relation":"is", "object":{"source":{"unit_ref":unit,"exact_quote":"$1500/month","context_quote":null},"type_hint":null},
+        "qualification":{"mode":"asserted","polarity":"positive","reported_by":[],"conditions":[],"temporal":[]},
+        "evidence":[unit]}, {"unexpected":"rejected sibling"}],"unresolved":[]}).to_string();
+    let graph = open::validate_partial(&raw, chunk, &request)?;
+    ensure!(graph["claims"].as_array().context("claims")?.len() == 1);
+    let mut extracted = OpenClaimsExtraction {
+        request,
+        graph,
+        usage: None,
+        raw_output: raw,
+        profile: policy.profile(&base, &prepared.preparation_profile)?,
+    };
+    let id = sink
+        .write_open_claims_candidates(chunk, &extracted, prepared, &base, &policy)
+        .await?;
+    ensure!(
+        sink.write_open_claims_candidates(chunk, &extracted, prepared, &base, &policy)
+            .await?
+            == id
+    );
+    ensure!(sink.candidate_exists(chunk, &extracted.profile).await?);
+    let metadata: Value =
+        sqlx::query_scalar("SELECT metadata FROM \"adapter-target\".\"source-docs\" WHERE id=$1")
+            .bind(&id)
+            .fetch_one(admin)
+            .await?;
+    ensure!(
+        metadata["profile"] == extracted.profile
+            && metadata["protocol_profile"] == extracted.request.profile
+            && metadata["validation_policy"] == open::CLAIM_LOCAL_POLICY
+            && metadata["candidate_graph"]["claims"]
+                .as_array()
+                .context("stored claims")?
+                .len()
+                == 1
+            && metadata["candidate_graph"]["rejected"]["claims"][0]["source_index"] == 1
+            && metadata["candidate_graph"]["canonical_writes"] == 0
+            && metadata["generation"] == extracted.raw_output
+    );
+    let mut foreign = chunk.clone();
+    foreign.document.key.scope = "tenant-b".into();
+    ensure!(
+        sink.write_open_claims_candidates(&foreign, &extracted, prepared, &base, &policy)
+            .await
+            .is_err()
+    );
+    ensure!(
+        sink.write_open_claims_candidates(chunk, &extracted, prepared, &"d".repeat(64), &policy)
+            .await
+            .is_err()
+    );
+    extracted.graph["canonical_writes"] = json!(1);
+    ensure!(
+        sink.write_open_claims_candidates(chunk, &extracted, prepared, &base, &policy)
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
 pub async fn exercise(sink: &PostgresSink, admin: &PgPool, config_text: &str) -> Result<()> {
     let mut indexed = super::document("atomic-postgres");
     let text = "Report\nMonthly budget $1500/month.";
@@ -66,6 +147,7 @@ pub async fn exercise(sink: &PostgresSink, admin: &PgPool, config_text: &str) ->
         "2026-01-01T00:00:00Z".parse()?,
         "b".repeat(64),
     )?;
+    exercise_open_claims(sink, admin, &chunk, &prepared).await?;
     let registry = Registry {
         entity_anchors: BTreeMap::from([("report".into(), AnchorKind::Facet)]),
         predicates: BTreeMap::from([(

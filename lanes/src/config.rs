@@ -144,6 +144,27 @@ impl Config {
             profile: blake3::hash(&signature).to_hex().to_string(),
         })
     }
+    pub fn extraction_profile(&self) -> Result<String> {
+        let chat = self.chat.as_ref().context("chat configuration required")?;
+        let base = crate::facts::ChatExtractor::profile_for(chat, &self.ontology)?;
+        if let Some(policy) = &self.fact_quality {
+            #[cfg(feature = "language")]
+            return policy.profile(
+                &base,
+                &crate::fact_preparation::FactPreparer::profile_for(self)?,
+            );
+            #[cfg(not(feature = "language"))]
+            {
+                let _ = policy;
+                anyhow::bail!("prepared fact extraction requires the language build feature");
+            }
+        }
+        ensure!(
+            self.language.is_none() && self.fact_context.is_none(),
+            "fact preparation configured without an explicit extraction policy; refusing legacy fallback"
+        );
+        Ok(base)
+    }
     pub fn validate(&self) -> Result<()> {
         self.ontology.validate()?;
         if let Some(chat) = &self.chat {
@@ -182,6 +203,14 @@ impl Config {
         }
         if let Some(quality) = &self.fact_quality {
             quality.validate(&self.ontology)?;
+            if quality.format == crate::quality::ExtractionFormat::OpenClaimsV3 {
+                ensure!(
+                    self.chat
+                        .as_ref()
+                        .is_some_and(|chat| matches!(chat.api, ChatApi::Responses)),
+                    "open claims require the native Responses API"
+                );
+            }
             ensure!(
                 self.language.is_some() && self.fact_context.is_some(),
                 "typed fact extraction requires local language and canonical context configuration"
