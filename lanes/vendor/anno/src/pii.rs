@@ -1,0 +1,862 @@
+//! PII (personally identifiable information) detection and redaction.
+//!
+//! Two detection paths:
+//! - [`classify_entity()`](crate::pii::classify_entity): classifies NER entities as PII (uses character offsets from `Entity`)
+//! - [`scan_patterns()`](crate::pii::scan_patterns): regex-based pre-NER scan for structured PII (SSN, credit card, IBAN, email, phone, address)
+//!
+//! After detection, use [`redact()`](crate::pii::redact) or [`pseudonymize()`](crate::pii::pseudonymize) to produce sanitized text.
+//!
+//! # Example
+//!
+//! ```
+//! use anno::{Model, StackedNER};
+//! use anno::pii;
+//!
+//! let m = StackedNER::default();
+//! let text = "John Smith's SSN is 123-45-6789.";
+//! let ents = m.extract_entities(text, None)?;
+//!
+//! // Classify NER entities as PII
+//! let mut pii_entities: Vec<pii::PiiEntity> = ents.iter().filter_map(pii::classify_entity).collect();
+//! // Also scan for structured PII patterns
+//! pii_entities.extend(pii::scan_patterns(text));
+//!
+//! let report = pii::report(&pii_entities);
+//! let redacted = pii::redact(text, &pii_entities);
+//! # Ok::<(), anno::Error>(())
+//! ```
+
+use crate::Entity;
+use regex::Regex;
+use std::collections::HashMap;
+
+/// A detected PII entity.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PiiEntity {
+    /// The PII text.
+    pub text: String,
+    /// Type of PII: `PERSON`, `DOB`, `ADDRESS`, `CONTACT`, `ID_NUMBER`.
+    pub pii_type: String,
+    /// Start character offset.
+    pub start: usize,
+    /// End character offset (exclusive).
+    pub end: usize,
+    /// Risk level: `LOW`, `MEDIUM`, `HIGH`, `CRITICAL`.
+    pub risk_level: String,
+}
+
+/// Summary of PII found in text.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PiiReport {
+    /// Count of person name entities.
+    pub person_count: usize,
+    /// Count of date/time entities (potential DOBs).
+    pub date_count: usize,
+    /// Count of address entities.
+    pub location_count: usize,
+    /// Count of contact info (email, phone).
+    pub contact_count: usize,
+    /// Count of ID numbers (SSN, credit card, IBAN).
+    pub id_number_count: usize,
+    /// All detected PII entities.
+    pub entities: Vec<PiiEntity>,
+    /// k-anonymity risk assessment.
+    pub k_anonymity_risk: String,
+}
+
+/// Classify an NER entity as PII.
+///
+/// Returns `None` if the entity is not PII (e.g., regular dates, general locations).
+pub fn classify_entity(entity: &Entity) -> Option<PiiEntity> {
+    let label = entity.entity_type.as_label();
+    let text = &entity.text;
+
+    let (pii_type, risk_level) = match label {
+        "PER" | "PERSON" => ("PERSON", assess_person_risk(text)),
+        "DATE" => {
+            if looks_like_dob(text) {
+                ("DOB", "HIGH")
+            } else {
+                return None;
+            }
+        }
+        "LOC" | "GPE" | "LOCATION" => {
+            if looks_like_address(text) {
+                ("ADDRESS", "HIGH")
+            } else {
+                return None;
+            }
+        }
+        "EMAIL" => ("CONTACT", "HIGH"),
+        "PHONE" => ("CONTACT", "HIGH"),
+        "URL" | "MONEY" => return None,
+        _ => {
+            if looks_like_id_number(text) {
+                ("ID_NUMBER", "CRITICAL")
+            } else {
+                return None;
+            }
+        }
+    };
+
+    Some(PiiEntity {
+        text: text.clone(),
+        pii_type: pii_type.to_string(),
+        start: entity.start(),
+        end: entity.end(),
+        risk_level: risk_level.to_string(),
+    })
+}
+
+/// Scan text for structured PII patterns (SSN, credit card, IBAN, email, phone, address).
+///
+/// This is independent of NER -- it catches structured PII via regex.
+/// Offsets are character offsets (Unicode scalar values), consistent with [`classify_entity`].
+pub fn scan_patterns(text: &str) -> Vec<PiiEntity> {
+    let mut results = Vec::new();
+
+    let patterns: &[(&str, &str, &str)] = &[
+        (r"\b\d{3}-\d{2}-\d{4}\b", "ID_NUMBER", "CRITICAL"),
+        (
+            r"\b\d{4}[- ]?\d{4}[- ]?\d{4}[- ]?\d{4}\b",
+            "ID_NUMBER",
+            "CRITICAL",
+        ),
+        (
+            r"\b[A-Z]{2}\d{2}[A-Z0-9]{4}\d{7}([A-Z0-9]{0,16})?\b",
+            "ID_NUMBER",
+            "CRITICAL",
+        ),
+        (
+            r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b",
+            "CONTACT",
+            "HIGH",
+        ),
+        (
+            r"(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b",
+            "CONTACT",
+            "HIGH",
+        ),
+        (
+            r"\b\d{1,5}\s+[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*\s+(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Drive|Dr|Lane|Ln|Way|Court|Ct|Place|Pl|Circle|Cir|Terrace|Ter)\.?(?:,\s*[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*,\s*[A-Z]{2}\s+\d{5}(?:-\d{4})?)?\b",
+            "ADDRESS",
+            "HIGH",
+        ),
+    ];
+
+    for &(pat, pii_type, risk) in patterns {
+        if let Ok(re) = Regex::new(pat) {
+            for m in re.find_iter(text) {
+                // Convert byte offsets from regex to character offsets
+                let start = text[..m.start()].chars().count();
+                let end = text[..m.end()].chars().count();
+                let overlaps = results
+                    .iter()
+                    .any(|e: &PiiEntity| !(end <= e.start || start >= e.end));
+                if !overlaps {
+                    results.push(PiiEntity {
+                        text: m.as_str().to_string(),
+                        pii_type: pii_type.to_string(),
+                        start,
+                        end,
+                        risk_level: risk.to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    results
+}
+
+/// Generate a PII report from detected entities.
+pub fn report(entities: &[PiiEntity]) -> PiiReport {
+    let mut person_count = 0;
+    let mut date_count = 0;
+    let mut location_count = 0;
+    let mut contact_count = 0;
+    let mut id_number_count = 0;
+
+    for e in entities {
+        match e.pii_type.as_str() {
+            "PERSON" => person_count += 1,
+            "DOB" => date_count += 1,
+            "ADDRESS" => location_count += 1,
+            "CONTACT" => contact_count += 1,
+            "ID_NUMBER" => id_number_count += 1,
+            _ => {}
+        }
+    }
+
+    let unique_names: std::collections::HashSet<_> = entities
+        .iter()
+        .filter(|e| e.pii_type == "PERSON")
+        .map(|e| e.text.to_lowercase())
+        .collect();
+
+    let k_anonymity_risk = if id_number_count > 0 {
+        "CRITICAL (direct identifiers present)"
+    } else if unique_names.len() > 5 && date_count > 0 && location_count > 0 {
+        "HIGH (quasi-identifier combination)"
+    } else if unique_names.len() > 3 {
+        "MEDIUM (multiple names)"
+    } else {
+        "LOW"
+    };
+
+    PiiReport {
+        person_count,
+        date_count,
+        location_count,
+        contact_count,
+        id_number_count,
+        entities: entities.to_vec(),
+        k_anonymity_risk: k_anonymity_risk.to_string(),
+    }
+}
+
+/// Redact PII by replacing with type tokens (`[PERSON_1]`, `[ID_NUMBER_2]`, etc.).
+///
+/// Entity offsets are character offsets (Unicode scalar values). Entities must
+/// not overlap -- overlapping spans produce garbled output because each
+/// replacement shifts byte offsets for subsequent replacements.
+pub fn redact(text: &str, entities: &[PiiEntity]) -> String {
+    let mut result = text.to_string();
+    let mut type_counts: HashMap<&str, usize> = HashMap::new();
+
+    // Deduplicate and remove overlapping spans before redacting.
+    // Sort by start ascending, longest span first for ties.
+    let mut sorted: Vec<_> = entities.iter().collect();
+    sorted.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
+    sorted.dedup_by(|a, b| a.start == b.start && a.end == b.end);
+    // Keep only non-overlapping spans (greedy, longest first at each position).
+    let mut max_end = 0;
+    sorted.retain(|e| {
+        if e.start < max_end {
+            false
+        } else {
+            max_end = e.end;
+            true
+        }
+    });
+    // Reverse for back-to-front replacement (so char offsets stay valid).
+    sorted.reverse();
+
+    for entity in sorted {
+        let count = type_counts.entry(&entity.pii_type).or_insert(0);
+        *count += 1;
+        let replacement = format!("[{}_{}]", entity.pii_type, count);
+        // Convert char offsets to byte offsets for replace_range
+        let byte_start: usize = result
+            .chars()
+            .take(entity.start)
+            .map(|c| c.len_utf8())
+            .sum();
+        let byte_end: usize = result.chars().take(entity.end).map(|c| c.len_utf8()).sum();
+        result.replace_range(byte_start..byte_end, &replacement);
+    }
+
+    result
+}
+
+/// Redact structured PII (SSN, credit card, IBAN, email, phone, address) from
+/// a string without loading an NER model.
+///
+/// Runs [`scan_patterns`] followed by [`redact`]. Suitable for log pipelines
+/// and other hot paths where model load time is unacceptable; catches all
+/// pattern-detectable PII but misses names (those require NER). For the full
+/// pipeline including name detection, use [`scan_and_redact`].
+///
+/// # Example
+///
+/// ```
+/// use anno::pii;
+///
+/// let scrubbed = pii::redact_patterns("SSN 123-45-6789 and email a@b.com");
+/// assert!(scrubbed.contains("[ID_NUMBER_1]"));
+/// assert!(scrubbed.contains("[CONTACT_1]"));
+/// ```
+pub fn redact_patterns(text: &str) -> String {
+    let entities = scan_patterns(text);
+    redact(text, &entities)
+}
+
+/// Replace each PII span with a fixed character (e.g. `'*'`), preserving length.
+///
+/// Useful for log display where position matters but content must be hidden.
+/// Counts are character-level, not byte-level — `mask("héllo", ..., '*')` on the
+/// entire span returns `"*****"` (5 chars), not `"******"`.
+///
+/// Entity offsets are character offsets. Overlapping spans are deduped the same
+/// way [`redact`] deduplicates them.
+pub fn mask(text: &str, entities: &[PiiEntity], fill: char) -> String {
+    apply_per_entity(text, entities, |entity| {
+        let width = entity.end.saturating_sub(entity.start);
+        std::iter::repeat_n(fill, width).collect::<String>()
+    })
+}
+
+/// Replace each PII span with a short fingerprint derived from the entity text.
+///
+/// The fingerprint is a 64-bit FxHash, hex-encoded. Same input always yields the
+/// same fingerprint in the same process, which lets downstream systems correlate
+/// occurrences of the same PII value without knowing its content. This is not
+/// cryptographically secure — use it for log-scrub and analytics, not secrets.
+///
+/// Format: `[<TYPE>_<8-hex>]`, e.g. `"[PERSON_a1b2c3d4]"`.
+pub fn fingerprint(text: &str, entities: &[PiiEntity]) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    apply_per_entity(text, entities, |entity| {
+        let mut h = DefaultHasher::new();
+        entity.text.hash(&mut h);
+        format!(
+            "[{}_{:08x}]",
+            entity.pii_type,
+            (h.finish() & 0xFFFF_FFFF) as u32
+        )
+    })
+}
+
+/// Apply a caller-supplied replacement function to each PII span.
+///
+/// Generic version of [`redact`] / [`mask`] / [`fingerprint`] — use this when
+/// the built-in operators don't fit. `replacement_fn` is called once per
+/// entity after dedup+sort; the return value replaces that span.
+///
+/// Entity offsets are character offsets; internal byte-offset conversion is
+/// handled here.
+pub fn replace<F>(text: &str, entities: &[PiiEntity], mut replacement_fn: F) -> String
+where
+    F: FnMut(&PiiEntity) -> String,
+{
+    apply_per_entity(text, entities, |e| replacement_fn(e))
+}
+
+/// Shared core for `redact` / `mask` / `fingerprint` / `replace`.
+///
+/// Deduplicates overlapping spans greedily (keeps longest-at-start), then
+/// walks them back-to-front so earlier char offsets remain valid during
+/// `replace_range` calls.
+fn apply_per_entity<F>(text: &str, entities: &[PiiEntity], mut replacement_fn: F) -> String
+where
+    F: FnMut(&PiiEntity) -> String,
+{
+    let mut result = text.to_string();
+
+    let mut sorted: Vec<_> = entities.iter().collect();
+    sorted.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
+    sorted.dedup_by(|a, b| a.start == b.start && a.end == b.end);
+    let mut max_end = 0;
+    sorted.retain(|e| {
+        if e.start < max_end {
+            false
+        } else {
+            max_end = e.end;
+            true
+        }
+    });
+    sorted.reverse();
+
+    for entity in sorted {
+        let byte_start: usize = result
+            .chars()
+            .take(entity.start)
+            .map(|c| c.len_utf8())
+            .sum();
+        let byte_end: usize = result.chars().take(entity.end).map(|c| c.len_utf8()).sum();
+        let replacement = replacement_fn(entity);
+        result.replace_range(byte_start..byte_end, &replacement);
+    }
+
+    result
+}
+
+/// Pseudonymize PII with consistent fake values.
+///
+/// Returns `(pseudonymized_text, mapping)` where mapping maps original -> fake
+/// for audit/re-identification purposes.
+pub fn pseudonymize(text: &str, entities: &[PiiEntity]) -> (String, HashMap<String, String>) {
+    let mut result = text.to_string();
+    let mut mapping: HashMap<String, String> = HashMap::new();
+    let mut name_counter = 0;
+    let mut date_counter = 0;
+    let mut addr_counter = 0;
+
+    let fake_names = [
+        "John Smith",
+        "Jane Doe",
+        "Alex Johnson",
+        "Sam Williams",
+        "Chris Brown",
+        "Pat Davis",
+        "Jordan Miller",
+        "Taylor Wilson",
+        "Morgan Lee",
+        "Casey Martinez",
+    ];
+
+    let mut sorted: Vec<_> = entities.iter().collect();
+    sorted.sort_by_key(|b| std::cmp::Reverse(b.start));
+
+    for entity in sorted {
+        let fake = if let Some(existing) = mapping.get(&entity.text) {
+            existing.clone()
+        } else {
+            let fake = match entity.pii_type.as_str() {
+                "PERSON" => {
+                    let name = fake_names[name_counter % fake_names.len()];
+                    name_counter += 1;
+                    name.to_string()
+                }
+                "DOB" => {
+                    date_counter += 1;
+                    format!("1990-01-{:02}", (date_counter % 28) + 1)
+                }
+                "ADDRESS" => {
+                    addr_counter += 1;
+                    format!("{} Main St", 100 + addr_counter)
+                }
+                "CONTACT" => {
+                    if entity.text.contains('@') {
+                        "contact@example.com".to_string()
+                    } else {
+                        format!("555-000-{:04}", (entity.start % 9000) + 1000)
+                    }
+                }
+                "ID_NUMBER" => "XXX-XX-XXXX".to_string(),
+                _ => "[REDACTED]".to_string(),
+            };
+            mapping.insert(entity.text.clone(), fake.clone());
+            fake
+        };
+
+        // Convert char offsets to byte offsets for replace_range
+        let byte_start: usize = result
+            .chars()
+            .take(entity.start)
+            .map(|c| c.len_utf8())
+            .sum();
+        let byte_end: usize = result.chars().take(entity.end).map(|c| c.len_utf8()).sum();
+        result.replace_range(byte_start..byte_end, &fake);
+    }
+
+    (result, mapping)
+}
+
+/// Scan for PII and redact in one call.
+///
+/// Combines [`classify_entity`] (NER-based) with [`scan_patterns`] (regex-based)
+/// and applies [`redact`].
+///
+/// ```
+/// use anno::{pii, Model, StackedNER};
+///
+/// let text = "John's SSN is 123-45-6789.";
+/// let m = StackedNER::default();
+/// let redacted = pii::scan_and_redact(text, &m)?;
+/// assert!(!redacted.contains("123-45-6789"));
+/// # Ok::<(), anno::Error>(())
+/// ```
+pub fn scan_and_redact(text: &str, model: &dyn crate::Model) -> crate::Result<String> {
+    let entities = model.extract_entities(text, None)?;
+    let mut pii_entities: Vec<PiiEntity> = entities.iter().filter_map(classify_entity).collect();
+    pii_entities.extend(scan_patterns(text));
+    dedup_overlapping(&mut pii_entities);
+    Ok(redact(text, &pii_entities))
+}
+
+/// Remove duplicate and overlapping PII entities, keeping the longest span.
+///
+/// After merging NER-based and regex-based detections, duplicates and overlaps
+/// are common (e.g., NER finds "John Smith" and regex finds "123-45-6789" within
+/// a span the NER also matched). This function sorts by start offset, then
+/// greedily keeps the longest non-overlapping spans.
+fn dedup_overlapping(entities: &mut Vec<PiiEntity>) {
+    // Sort by start, then longest span first for ties
+    entities.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
+    // Dedup exact duplicates
+    entities.dedup_by(|a, b| a.start == b.start && a.end == b.end);
+    // Remove overlaps: keep the first (longest at each start position)
+    let mut max_end = 0;
+    entities.retain(|e| {
+        if e.start < max_end {
+            false // overlaps with a prior span
+        } else {
+            max_end = e.end;
+            true
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+fn assess_person_risk(text: &str) -> &'static str {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.len() >= 3 {
+        "HIGH"
+    } else if words.len() == 2 {
+        "MEDIUM"
+    } else {
+        "LOW"
+    }
+}
+
+fn looks_like_dob(text: &str) -> bool {
+    Regex::new(r"19[0-9]{2}|20[0-1][0-9]")
+        .map(|re| re.is_match(text))
+        .unwrap_or(false)
+}
+
+/// Check if text looks like a physical address.
+pub fn looks_like_address(text: &str) -> bool {
+    let has_number = text.chars().any(|c| c.is_numeric());
+    let street_indicators = [
+        "St", "Street", "Ave", "Avenue", "Rd", "Road", "Blvd", "Dr", "Lane", "Ln", "Way", "Drive",
+        "Court", "Ct", "Place", "Pl", "Circle", "Cir",
+    ];
+    let has_street = street_indicators.iter().any(|ind| text.contains(ind));
+
+    let has_zip = Regex::new(r"\b\d{5}(?:-\d{4})?\b")
+        .map(|re| re.is_match(text))
+        .unwrap_or(false);
+    let us_states = [
+        "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID", "IL", "IN", "IA",
+        "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
+        "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VT",
+        "VA", "WA", "WV", "WI", "WY", "DC",
+    ];
+    let has_state = us_states.iter().any(|s| text.contains(s));
+
+    (has_number && has_street) || (has_zip && has_state)
+}
+
+/// Check if text looks like an ID number (SSN, credit card, IBAN, MRN).
+pub fn looks_like_id_number(text: &str) -> bool {
+    if let Ok(re) = Regex::new(r"\d{3}-\d{2}-\d{4}") {
+        if re.is_match(text) {
+            return true;
+        }
+    }
+    if let Ok(re) = Regex::new(r"\d{4}[- ]?\d{4}[- ]?\d{4}[- ]?\d{4}") {
+        if re.is_match(text) {
+            return true;
+        }
+    }
+    if let Ok(re) = Regex::new(r"[A-Z]{2}\d{2}[A-Z0-9]{4}\d{7}([A-Z0-9]{0,16})?") {
+        if re.is_match(text) {
+            return true;
+        }
+    }
+    // Alphanumeric catch-all for short ID-like tokens (e.g. MRNs, short codes).
+    // Require that digits make up at least half the characters to avoid
+    // false-positives on version strings like "Python3", "iPhone6", "Cent0S".
+    let digit_count = text.chars().filter(|c| c.is_ascii_digit()).count();
+    if text.len() >= 6
+        && text.len() <= 10
+        && text.chars().all(|c| c.is_alphanumeric())
+        && digit_count * 2 >= text.len()
+    {
+        return true;
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssn_detected_by_scan() {
+        let pii = scan_patterns("My SSN is 123-45-6789 and that's it.");
+        assert!(pii.iter().any(|p| p.text == "123-45-6789"));
+    }
+
+    #[test]
+    fn credit_card_detected() {
+        let pii = scan_patterns("Card: 4111-1111-1111-1111 on file.");
+        assert!(pii.iter().any(|p| p.text == "4111-1111-1111-1111"));
+    }
+
+    #[test]
+    fn email_detected() {
+        let pii = scan_patterns("Contact me at bob@example.com please.");
+        assert!(pii.iter().any(|p| p.pii_type == "CONTACT"));
+    }
+
+    #[test]
+    fn iban_detected() {
+        assert!(looks_like_id_number("DE89370400440532013000"));
+    }
+
+    #[test]
+    fn common_word_not_id() {
+        assert!(!looks_like_id_number("Chemistry"));
+    }
+
+    #[test]
+    fn version_strings_not_id() {
+        assert!(!looks_like_id_number("Python3"));
+        assert!(!looks_like_id_number("Win10"));
+        assert!(!looks_like_id_number("iPhone6"));
+        assert!(!looks_like_id_number("Cent0S"));
+    }
+
+    #[test]
+    fn address_with_zip() {
+        assert!(looks_like_address("1234 Elm Street, Springfield, IL 62704"));
+    }
+
+    #[test]
+    fn redact_replaces_pii() {
+        // "My SSN is " = 10 chars, "123-45-6789" = chars 10..21
+        let entities = vec![PiiEntity {
+            text: "123-45-6789".to_string(),
+            pii_type: "ID_NUMBER".to_string(),
+            start: 10,
+            end: 21,
+            risk_level: "CRITICAL".to_string(),
+        }];
+        let result = redact("My SSN is 123-45-6789.", &entities);
+        assert_eq!(result, "My SSN is [ID_NUMBER_1].");
+    }
+
+    #[test]
+    fn redact_non_ascii() {
+        // "caf\u{e9}" is 4 chars (e with accent = 1 char, 2 bytes)
+        let text = "caf\u{e9} SSN: 123-45-6789.";
+        let entities = vec![PiiEntity {
+            text: "123-45-6789".to_string(),
+            pii_type: "ID_NUMBER".to_string(),
+            start: 10, // "caf\u{e9} SSN: " = 10 chars
+            end: 21,   // 10 + 11 chars
+            risk_level: "CRITICAL".to_string(),
+        }];
+        let result = redact(text, &entities);
+        assert_eq!(result, "caf\u{e9} SSN: [ID_NUMBER_1].");
+        assert!(!result.contains("123-45-6789"));
+    }
+
+    #[test]
+    fn scan_patterns_returns_char_offsets() {
+        let text = "caf\u{e9} SSN: 123-45-6789 end";
+        let pii = scan_patterns(text);
+        let ssn = pii.iter().find(|p| p.text == "123-45-6789");
+        assert!(ssn.is_some(), "should detect SSN");
+        let ssn = ssn.unwrap();
+        // Verify these are char offsets, not byte offsets
+        let extracted: String = text
+            .chars()
+            .skip(ssn.start)
+            .take(ssn.end - ssn.start)
+            .collect();
+        assert_eq!(extracted, "123-45-6789");
+    }
+
+    #[test]
+    fn pseudonymize_consistent() {
+        let entities = vec![
+            PiiEntity {
+                text: "bob@example.com".to_string(),
+                pii_type: "CONTACT".to_string(),
+                start: 0,
+                end: 15,
+                risk_level: "HIGH".to_string(),
+            },
+            PiiEntity {
+                text: "555-867-5309".to_string(),
+                pii_type: "CONTACT".to_string(),
+                start: 20,
+                end: 32,
+                risk_level: "HIGH".to_string(),
+            },
+        ];
+        let (result, mapping) = pseudonymize("bob@example.com --- 555-867-5309", &entities);
+        assert!(mapping.get("bob@example.com").unwrap().contains('@'));
+        assert!(mapping.get("555-867-5309").unwrap().starts_with("555-000-"));
+        assert!(!result.contains("bob@example.com"));
+    }
+
+    #[test]
+    fn pseudonymize_same_entity_gets_same_pseudonym() {
+        // The same entity text appearing twice should produce the same pseudonym.
+        let entities = vec![
+            PiiEntity {
+                text: "John Smith".to_string(),
+                pii_type: "PERSON".to_string(),
+                start: 0,
+                end: 10,
+                risk_level: "MEDIUM".to_string(),
+            },
+            PiiEntity {
+                text: "John Smith".to_string(),
+                pii_type: "PERSON".to_string(),
+                start: 15,
+                end: 25,
+                risk_level: "MEDIUM".to_string(),
+            },
+        ];
+        let text = "John Smith met John Smith again.";
+        let (result, mapping) = pseudonymize(text, &entities);
+        let fake = mapping
+            .get("John Smith")
+            .expect("mapping should contain John Smith");
+        // Both occurrences should be replaced with the same pseudonym
+        assert_eq!(
+            result.matches(fake.as_str()).count(),
+            2,
+            "Both occurrences of 'John Smith' should map to the same pseudonym '{}', got: {}",
+            fake,
+            result
+        );
+    }
+
+    #[test]
+    fn redact_overlapping_spans_no_panic() {
+        // Overlapping spans should be resolved gracefully (no panic, no garbled output).
+        // The implementation drops the inner span, keeping the outer one.
+        let entities = vec![
+            PiiEntity {
+                text: "John Smith".to_string(),
+                pii_type: "PERSON".to_string(),
+                start: 0,
+                end: 10,
+                risk_level: "MEDIUM".to_string(),
+            },
+            PiiEntity {
+                // Overlaps with "John Smith"
+                text: "John".to_string(),
+                pii_type: "PERSON".to_string(),
+                start: 0,
+                end: 4,
+                risk_level: "LOW".to_string(),
+            },
+        ];
+        let text = "John Smith called.";
+        // Should not panic and should produce valid UTF-8 output
+        let result = redact(text, &entities);
+        assert!(
+            !result.contains("John Smith"),
+            "original text should be redacted"
+        );
+        assert!(
+            result.contains("called"),
+            "non-PII text should be preserved"
+        );
+    }
+
+    #[test]
+    fn report_counts() {
+        let entities = vec![
+            PiiEntity {
+                text: "John".to_string(),
+                pii_type: "PERSON".to_string(),
+                start: 0,
+                end: 4,
+                risk_level: "LOW".to_string(),
+            },
+            PiiEntity {
+                text: "123-45-6789".to_string(),
+                pii_type: "ID_NUMBER".to_string(),
+                start: 10,
+                end: 21,
+                risk_level: "CRITICAL".to_string(),
+            },
+        ];
+        let r = report(&entities);
+        assert_eq!(r.person_count, 1);
+        assert_eq!(r.id_number_count, 1);
+        assert!(r.k_anonymity_risk.starts_with("CRITICAL"));
+    }
+
+    #[test]
+    fn mask_preserves_length_and_position() {
+        let text = "John met Alice.";
+        let entities = vec![
+            PiiEntity {
+                text: "John".to_string(),
+                pii_type: "PERSON".to_string(),
+                start: 0,
+                end: 4,
+                risk_level: "LOW".to_string(),
+            },
+            PiiEntity {
+                text: "Alice".to_string(),
+                pii_type: "PERSON".to_string(),
+                start: 9,
+                end: 14,
+                risk_level: "LOW".to_string(),
+            },
+        ];
+        let masked = mask(text, &entities, '*');
+        assert_eq!(masked, "**** met *****.");
+    }
+
+    #[test]
+    fn mask_handles_multibyte_unicode() {
+        // "café" is 4 chars (4 code points) but 5 bytes in UTF-8.
+        // mask works in character-space, so the result has 4 fill chars.
+        let text = "café alice";
+        let entities = vec![PiiEntity {
+            text: "café".to_string(),
+            pii_type: "PERSON".to_string(),
+            start: 0,
+            end: 4,
+            risk_level: "LOW".to_string(),
+        }];
+        let masked = mask(text, &entities, '#');
+        assert_eq!(masked, "#### alice");
+    }
+
+    #[test]
+    fn fingerprint_is_deterministic_same_input() {
+        let text = "John met John.";
+        let entities = vec![
+            PiiEntity {
+                text: "John".to_string(),
+                pii_type: "PERSON".to_string(),
+                start: 0,
+                end: 4,
+                risk_level: "LOW".to_string(),
+            },
+            PiiEntity {
+                text: "John".to_string(),
+                pii_type: "PERSON".to_string(),
+                start: 9,
+                end: 13,
+                risk_level: "LOW".to_string(),
+            },
+        ];
+        let fp = fingerprint(text, &entities);
+        // Both occurrences of "John" should receive the same fingerprint.
+        let tokens: Vec<&str> = fp
+            .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '[' && c != ']')
+            .filter(|s| s.starts_with("[PERSON_") && s.ends_with(']'))
+            .collect();
+        assert_eq!(
+            tokens.len(),
+            2,
+            "expected two fingerprint tokens, got {fp:?}"
+        );
+        assert_eq!(
+            tokens[0], tokens[1],
+            "identical entity text must produce identical fingerprint"
+        );
+    }
+
+    #[test]
+    fn replace_applies_caller_fn() {
+        let text = "SSN 123-45-6789 recorded.";
+        let entities = vec![PiiEntity {
+            text: "123-45-6789".to_string(),
+            pii_type: "ID_NUMBER".to_string(),
+            start: 4,
+            end: 15,
+            risk_level: "CRITICAL".to_string(),
+        }];
+        let replaced = replace(text, &entities, |e| format!("<{}>", e.pii_type));
+        assert_eq!(replaced, "SSN <ID_NUMBER> recorded.");
+    }
+}

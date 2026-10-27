@@ -1,4 +1,5 @@
 /target
+/lanes/target/
 .git
 aurelius_db
 .claude

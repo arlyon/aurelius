@@ -6,34 +6,85 @@ publish = false
 
 [workspace]
 
+[patch.crates-io]
+anno = { path = "vendor/anno" }
+
 [features]
-integration-tests = []
+default = []
+postgres = ["dep:sqlx"]
+language = ["dep:anno", "dep:nlprule", "dep:ort", "dep:tokenizers"]
+temporal-tests = ["temporal", "temporalio-sdk/testing"]
+temporal = ["dep:axum", "dep:temporalio-sdk", "dep:temporalio-client", "dep:temporalio-macros", "dep:temporalio-common", "dep:temporalio-workflow", "dep:futures"]
+
+[[example]]
+name = "fact_lab"
+path = "examples/fact_lab.rs"
+required-features = ["language"]
 
 [[test]]
-name = "review_feed"
-path = "tests/review_feed.rs"
-required-features = ["integration-tests"]
+name = "fact_lab"
+path = "tests/fact_lab.rs"
+required-features = ["language"]
+
+[[example]]
+name = "atomic_snapshot"
+path = "examples/atomic_snapshot.rs"
+required-features = ["postgres", "language"]
+
+[[example]]
+name = "atomic_facts"
+path = "examples/atomic_facts.rs"
+required-features = ["postgres", "language"]
+
+[[example]]
+name = "weekend_facts"
+path = "examples/weekend_facts.rs"
+required-features = ["postgres", "language"]
+
+[[example]]
+name = "quality_pilot"
+path = "examples/quality_pilot.rs"
+required-features = ["postgres", "language"]
+
+[[test]]
+name = "postgres"
+path = "tests/postgres.rs"
+required-features = ["postgres"]
+
+[[test]]
+name = "temporal"
+path = "tests/temporal.rs"
+required-features = ["temporal-tests"]
 
 [dependencies]
+axum = { version = "0.8", optional = true }
 anyhow = "1"
-async-trait = "0.1"
-axum = "0.8"
+anno = { version = "=0.13.0", optional = true, default-features = false, features = ["onnx"] }
+nlprule = { version = "=0.6.4", optional = true }
+ort = { version = "=2.0.0-rc.12", optional = true, default-features = false, features = ["load-dynamic"] }
+tokenizers = { version = "0.22", optional = true, default-features = false, features = ["onig"] }
 blake3 = "1"
-chrono = { version = "0.4", features = ["serde"] }
-flate2 = "1"
-futures = "0.3"
-kreuzberg = { version = "=4.10.4", default-features = false, features = ["tokio-runtime", "html", "chunking"] }
+base64 = "0.22"
 object_store = { version = "0.14", features = ["aws"] }
-pgvector = { version = "0.4", features = ["sqlx"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+futures-util = "0.3"
+sqlx = { version = "0.9", optional = true, default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "chrono", "json"] }
+flate2 = "1"
+regex = "1"
+encoding_rs = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
-subtle = "2.6"
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "chrono", "uuid", "json", "migrate", "macros"] }
-swiftide-core = { version = "=0.32.1", default-features = false }
-swiftide-indexing = { version = "=0.32.1", default-features = false }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal", "io-util", "io-std", "net", "process"] }
+toml = "1.1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid = { version = "1", features = ["v4", "serde"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+temporalio-sdk = { version = "=1.1.0", optional = true }
+temporalio-client = { version = "=1.1.0", optional = true }
+temporalio-macros = { version = "=1.1.0", optional = true }
+temporalio-common = { version = "=1.1.0", optional = true }
+temporalio-workflow = { version = "=1.1.0", optional = true }
+futures = { version = "0.3", optional = true }
+
+[dev-dependencies]
+axum = "0.8"

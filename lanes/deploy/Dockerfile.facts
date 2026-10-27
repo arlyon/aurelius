@@ -1,0 +1,11 @@
+FROM docker.io/library/debian@sha256:f3034a6ec3c1205360777c4aae76234998866ad18806ae62b63a3f84ccad782b
+RUN apt-get update && apt-get install --yes --no-install-recommends ca-certificates libstdc++6 && rm -rf /var/lib/apt/lists/*
+COPY weekend_facts fact_lab /app/
+COPY models/ /opt/models/
+COPY ort/ /opt/ort/
+COPY licenses/ /opt/licenses/
+COPY smoke/ /opt/smoke/
+RUN chmod -R a+rX /opt/smoke /opt/licenses
+ENV ORT_DYLIB_PATH=/opt/ort/libonnxruntime.so.1.24.4 ANNO_NO_DOWNLOADS=1 HOME=/tmp
+USER 65532:65532
+ENTRYPOINT ["/app/weekend_facts"]
