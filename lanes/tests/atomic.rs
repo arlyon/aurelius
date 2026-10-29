@@ -10,6 +10,40 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[test]
+fn fact_runtime_accepts_only_atomic_and_never_defaults_to_a_legacy_extractor() -> Result<()> {
+    use aurelius_lanes::config::Config;
+    let mut config = Config::parse(include_str!("fixtures/business.toml"))?;
+    assert!(config.validate_fact_runtime().is_err());
+    config.chat = Some(serde_json::from_value(json!({
+        "endpoint":"http://127.0.0.1:1234/responses", "model":"fixture",
+        "revision":"fixture", "api":"responses"
+    }))?);
+    config.language = Some(serde_json::from_value(json!({
+        "model_dir":"not-loaded-by-validation", "max_document_tokens":512, "threads":1
+    }))?);
+    config.fact_context = Some(serde_json::from_value(json!({
+        "schema":"public", "table":"entities", "per_entity_limit":1
+    }))?);
+    for format in [
+        None,
+        Some("typed"),
+        Some("open_claims_v3"),
+        Some("atomic_spo_v3"),
+    ] {
+        let mut policy = json!({"context_as_of":"2026-01-01T00:00:00Z"});
+        if let Some(format) = format {
+            policy["format"] = json!(format);
+        }
+        config.fact_quality = Some(serde_json::from_value(policy)?);
+        assert_eq!(
+            config.validate_fact_runtime().is_ok(),
+            format == Some("atomic_spo_v3")
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn atomic_runtime_restores_the_preserved_registry_with_a_distinct_profile() -> Result<()> {
     use aurelius_lanes::{
         config::Config,

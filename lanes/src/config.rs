@@ -144,6 +144,16 @@ impl Config {
             profile: blake3::hash(&signature).to_hex().to_string(),
         })
     }
+    pub fn validate_fact_runtime(&self) -> Result<()> {
+        self.validate()?;
+        ensure!(
+            self.fact_quality.as_ref().is_some_and(|policy| {
+                policy.format == crate::quality::ExtractionFormat::AtomicSpoV3
+            }),
+            "fact runtime requires atomic_spo_v3; legacy formats are offline replay only"
+        );
+        Ok(())
+    }
     pub fn extraction_profile(&self) -> Result<String> {
         let chat = self.chat.as_ref().context("chat configuration required")?;
         let base =

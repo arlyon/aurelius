@@ -550,16 +550,13 @@ async fn direct_ingestion_keeps_source_storage_read_only(
         .as_mut()
         .context("fixture gateway")?
         .token_env = "SOURCE_API_TEST_CLIENT_SECRET".into();
-    assert_eq!(
-        aurelius_lanes::enrichment::FactEngine::requests(&planning)?.len(),
-        1,
-        "workflow identity planning must not connect to PG"
+    assert!(
+        aurelius_lanes::enrichment::FactEngine::requests(&planning).is_err(),
+        "legacy configuration must be rejected before opening PG or reading credentials"
     );
-    let shared = aurelius_lanes::enrichment::FactEngine::with_sink(planning, sink.clone())?;
-    assert_eq!(
-        shared.request("tenant-a")?.scope,
-        "tenant-a",
-        "shared-pool engine tried to open a second DB pool"
+    assert!(
+        aurelius_lanes::enrichment::FactEngine::with_sink(planning, sink.clone()).is_err(),
+        "shared-pool construction must not enable the legacy extractor"
     );
     let mut url = reqwest::Url::parse(&std::env::var("PG_ADAPTER_TEST_URL")?)?;
     url.set_username("adapter_writer")

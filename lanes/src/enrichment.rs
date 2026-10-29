@@ -102,9 +102,10 @@ pub async fn enrich_once<A: FactActivities>(
 #[cfg(feature = "postgres")]
 mod runtime {
     use super::*;
+    #[cfg(feature = "language")]
+    use crate::contracts::Chunk;
     use crate::{
         config::Config,
-        contracts::Chunk,
         facts::{ChatExtractor, ExtractionReview},
         postgres::PostgresSink,
     };
@@ -119,11 +120,13 @@ mod runtime {
         preparer: Option<crate::fact_preparation::FactPreparer>,
         #[cfg(feature = "language")]
         provider_metadata: Option<crate::provider_metadata::ProviderMetadataReader>,
+        #[cfg(feature = "language")]
         config: Config,
         profiles: BTreeMap<String, Vec<String>>,
     }
     impl FactEngine {
         pub async fn new(config: Config) -> Result<Self> {
+            config.validate_fact_runtime()?;
             let sink = PostgresSink::connect(
                 config
                     .postgres
@@ -150,6 +153,7 @@ mod runtime {
             sink: PostgresSink,
             stores: BTreeMap<String, std::sync::Arc<dyn object_store::ObjectStore>>,
         ) -> Result<Self> {
+            config.validate_fact_runtime()?;
             let reader = crate::provider_metadata::ProviderMetadataReader::with_storage(
                 config.clone(),
                 stores,
@@ -161,7 +165,7 @@ mod runtime {
             sink: PostgresSink,
             reader: Option<crate::provider_metadata::ProviderMetadataReader>,
         ) -> Result<Self> {
-            config.validate()?;
+            config.validate_fact_runtime()?;
             #[cfg(not(feature = "language"))]
             let _ = reader;
             let chat = config
@@ -211,12 +215,13 @@ mod runtime {
                 preparer,
                 #[cfg(feature = "language")]
                 provider_metadata,
+                #[cfg(feature = "language")]
                 config,
                 profiles,
             })
         }
         pub fn requests(config: &Config) -> Result<Vec<FactRequest>> {
-            config.validate()?;
+            config.validate_fact_runtime()?;
             let chat = config
                 .chat
                 .as_ref()
@@ -348,7 +353,7 @@ mod runtime {
                     continue;
                 }
                 let stored = async {
-                    if policy.format == crate::quality::ExtractionFormat::AtomicSpoV3 {
+                    {
                         let registry = policy.atomic_registry()?;
                         let extracted = self
                             .extractor
@@ -368,50 +373,11 @@ mod runtime {
                                 policy,
                             )
                             .await?;
-                        Ok((
+                        Ok::<_, anyhow::Error>((
                             extracted.graph.assertions.len(),
                             !extracted.graph.review_items.is_empty()
                                 || !extracted.graph.unresolved_entity_ids.is_empty(),
                         ))
-                    } else if policy.format == crate::quality::ExtractionFormat::OpenClaimsV3 {
-                        let extracted = self
-                            .extractor
-                            .extract_open_claims(&chunk, &prepared, policy)
-                            .await?;
-                        self.sink
-                            .write_open_claims_candidates(
-                                &chunk,
-                                &extracted,
-                                &prepared,
-                                &self.extractor.profile,
-                                policy,
-                            )
-                            .await?;
-                        let claims = extracted.graph["claims"]
-                            .as_array()
-                            .context("validated open claims missing")?
-                            .len();
-                        let rejected = ["claims", "unresolved"].into_iter().any(|kind| {
-                            extracted.graph["rejected"][kind]
-                                .as_array()
-                                .is_some_and(|items| !items.is_empty())
-                        });
-                        Ok::<_, anyhow::Error>((claims, rejected))
-                    } else {
-                        let graph = self
-                            .extractor
-                            .extract_quality(&chunk, &prepared, policy, &self.profile)
-                            .await?;
-                        self.sink
-                            .write_quality_candidates(
-                                &chunk,
-                                &graph,
-                                &prepared,
-                                &self.config.ontology,
-                                policy,
-                            )
-                            .await?;
-                        Ok((graph.candidates.len(), !graph.rejections.is_empty()))
                     }
                 }
                 .await;
@@ -512,110 +478,38 @@ mod runtime {
                 }
                 Err(error) => return Err(error),
             };
-            if self.config.fact_quality.is_some() {
-                #[cfg(feature = "language")]
-                {
-                    return match self
-                        .run_quality(source.clone(), receipt.clone(), input)
-                        .await
-                    {
-                        Err(error)
-                            if matches!(
-                                error.downcast_ref::<ExtractionReview>(),
-                                Some(ExtractionReview::Input)
-                            ) =>
-                        {
-                            self.sink
-                                .record_fact_status(
-                                    scope,
-                                    &source.artifact_id,
-                                    profile,
-                                    None,
-                                    "input_review",
-                                )
-                                .await?;
-                            receipt.status = FactStatus::Deferred;
-                            Ok(receipt)
-                        }
-                        result => result,
-                    };
-                }
-                #[cfg(not(feature = "language"))]
-                anyhow::bail!("typed fact extraction requires the language build feature");
-            }
-            let references = match self
-                .config
-                .chat
-                .as_ref()
-                .context("chat configuration required")?
-                .references
-                .resolve(&input.document)
+            #[cfg(feature = "language")]
             {
-                Ok(references) => references,
-                Err(_) => {
-                    self.sink
-                        .record_fact_status(
-                            scope,
-                            &source.artifact_id,
-                            profile,
-                            None,
-                            "input_review",
-                        )
-                        .await?;
-                    receipt.status = FactStatus::Deferred;
-                    return Ok(receipt);
-                }
-            };
-            for range in input.ranges {
-                let chunk = Chunk {
-                    document: input.document.clone(),
-                    range,
-                };
-                if self.sink.candidate_exists(&chunk, profile).await? {
-                    receipt.skipped_windows += 1;
-                    continue;
-                }
-                if self
-                    .sink
-                    .fact_status(scope, &source.artifact_id, profile, Some(range))
-                    .await?
-                    .is_some()
+                return match self
+                    .run_quality(source.clone(), receipt.clone(), input)
+                    .await
                 {
-                    receipt.review_windows += 1;
-                    continue;
-                }
-                match self.extractor.extract(&chunk).await {
-                    Ok(graph) => {
-                        self.sink
-                            .write_candidates(&chunk, &graph, &references)
-                            .await?;
-                        receipt.stored_windows += 1;
-                        receipt.new_claims += graph.claims.len();
-                    }
-                    Err(error) => {
-                        let reason = match error.downcast_ref::<ExtractionReview>() {
-                            Some(ExtractionReview::Input) => "input_review",
-                            Some(ExtractionReview::Output) => "output_rejected",
-                            None => return Err(error),
-                        };
+                    Err(error)
+                        if matches!(
+                            error.downcast_ref::<ExtractionReview>(),
+                            Some(ExtractionReview::Input)
+                        ) =>
+                    {
                         self.sink
                             .record_fact_status(
                                 scope,
                                 &source.artifact_id,
                                 profile,
-                                Some(range),
-                                reason,
+                                None,
+                                "input_review",
                             )
                             .await?;
-                        receipt.review_windows += 1;
+                        receipt.status = FactStatus::Deferred;
+                        Ok(receipt)
                     }
-                }
+                    result => result,
+                };
             }
-            self.sink
-                .record_fact_status(scope, &source.artifact_id, profile, None, "complete")
-                .await?;
-            tracing::info!(org_id=%scope,profile=%profile,stored_windows=receipt.stored_windows,review_windows=receipt.review_windows,new_claims=receipt.new_claims,"fact source processed");
-            Ok(receipt)
+            #[cfg(not(feature = "language"))]
+            {
+                let _ = input;
+                anyhow::bail!("typed fact extraction requires the language build feature");
+            }
         }
     }
     impl FactActivities for FactEngine {
