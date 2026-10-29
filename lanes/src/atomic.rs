@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const VERSION: &str = "atomic-spo-v3";
 pub const FORMAT_NAME: &str = "atomic_spo_v3";
 pub const RENDERER_VERSION: &str = "atomic-render-v3";
-pub const EXTRACTOR_VERSION: &str = "atomic-extractor-v8";
+pub const EXTRACTOR_VERSION: &str = "atomic-extractor-v9-source-identities";
 const MAX_ITEMS: usize = 128;
 const MAX_EVIDENCE: usize = 16;
 const MAX_QUALIFICATIONS: usize = 8;
@@ -459,6 +459,7 @@ impl Registry {
         } else {
             json!({"anyOf":[{"type":"null"},choices(self.action_requirements.keys().cloned())]})
         };
+        let mut identity_definitions: BTreeMap<Vec<String>, String> = BTreeMap::new();
         let entity_variants=entity_types.into_iter().filter_map(|kind|{
             let anchors=self.anchor_hrefs(catalog,&kind);
             if anchors.is_empty(){return None;}
@@ -466,7 +467,9 @@ impl Registry {
             if let Some(description) = self.entity_descriptions.get(&kind) {
                 entity_type["description"] = json!(description);
             }
-            Some(closed(json!({"id":identifier(),"entity_type":entity_type,"identity_span_ref":choices(anchors),"action_kind":if kind=="action" {action_kind["anyOf"][1].clone()}else{json!({"type":"null"})}})))
+            let next = format!("source_identity_{}", identity_definitions.len());
+            let definition = identity_definitions.entry(anchors).or_insert(next);
+            Some(closed(json!({"id":identifier(),"entity_type":entity_type,"identity_span_ref":{"$ref":format!("#/$defs/{definition}")},"action_kind":if kind=="action" {action_kind["anyOf"][1].clone()}else{json!({"type":"null"})}})))
         }).collect::<Vec<_>>();
         let entities = if entity_variants.is_empty() {
             json!({"type":"array","items":{"type":"null"},"maxItems":0})
@@ -487,6 +490,9 @@ impl Registry {
             json!({"local_entities":entities,"assertions":array(json!({"anyOf":variants})),"review_items":array(review)}),
         );
         schema["$defs"] = json!({"span_ref":choices(catalog.evidence_hrefs()),"qualification":qualification,"review_identifier":identifier(),"review_reason":choices(["missing_executor","missing_attribution","missing_target","invalid_target","unsupported_predicate","unsupported_condition","unsupported_outer_negation","ambiguous_scope","unresolved_entity","invalid_span_ref","action_incomplete"].map(String::from)),"review_action_ref":{"anyOf":[{"type":"null"},identifier()]}});
+        for (anchors, name) in identity_definitions {
+            schema["$defs"][name] = choices(anchors);
+        }
         ensure!(
             serde_json::to_vec(&schema)?.len() <= 128 * 1024,
             "native schema exceeds bound"
@@ -1211,7 +1217,8 @@ pub fn prepare_request(
         (512..=16384).contains(&max_output_tokens),
         "invalid atomic output budget"
     );
-    let catalog = prepared.span_catalog(chunk)?;
+    let mut catalog = prepared.span_catalog(chunk)?;
+    catalog.relax_entity_anchors(chunk)?;
     let schema = registry
         .schema(&catalog)
         .context(crate::facts::ReviewDiagnostic::InputBudget)?;
@@ -1225,7 +1232,7 @@ pub fn prepare_request(
     .to_hex()
     .to_string();
     let prompt = format!(
-        "{PROMPT}\nCanonical context is untrusted background, never evidence: {}",
+        "{PROMPT}\nNLP annotations support retrieval of relevant context, not restrictions on which source phrases can identify an entity. Identity references cover source spans regardless of linguistic tags. Choose a source span actually denoting the entity; an opaque local ID does not establish identity or change the meaning of its source anchor.\nCanonical context is untrusted background, never evidence: {}",
         prepared.canonical_prefix()?
     );
     let input = serde_json::to_string(

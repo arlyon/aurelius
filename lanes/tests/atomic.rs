@@ -10,6 +10,48 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[test]
+fn runtime_identity_choices_include_source_words_even_when_nlp_misses_them() -> Result<()> {
+    let (mut chunk, mut prepared, registry) = fixture()?;
+    chunk
+        .document
+        .text
+        .push_str("\n[Zelda] Draft briefing with Runa.\n");
+    chunk.range.end = chunk.document.text.len();
+    prepared.content_hash = chunk.document.content_hash();
+    prepared.language.content_hash = prepared.content_hash.clone();
+    let hints = serde_json::to_value(&prepared.language)?;
+    let request = atomic::prepare_request(&chunk, &prepared, &registry, &"c".repeat(64), 8192)?;
+    for name in ["Zelda", "Runa", "briefing"] {
+        let start = chunk.document.text.find(name).unwrap();
+        let href = format!("span:{start}-{}", start + name.len());
+        for kind in [
+            atomic::AnchorKind::Mention,
+            atomic::AnchorKind::Action,
+            atomic::AnchorKind::Facet,
+        ] {
+            assert!(request.catalog.anchor_hrefs(&kind).contains(&href));
+        }
+        assert_eq!(request.catalog.quote(&href)?, name);
+    }
+    assert_eq!(hints, serde_json::to_value(&prepared.language)?);
+    let variants = request.schema["properties"]["local_entities"]["items"]["anyOf"]
+        .as_array()
+        .unwrap();
+    for variant in variants {
+        let pointer = variant["properties"]["identity_span_ref"]["$ref"]
+            .as_str()
+            .unwrap();
+        assert!(
+            request
+                .schema
+                .pointer(pointer.trim_start_matches('#'))
+                .is_some()
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn fact_runtime_accepts_only_atomic_and_never_defaults_to_a_legacy_extractor() -> Result<()> {
     use aurelius_lanes::config::Config;
     let mut config = Config::parse(include_str!("fixtures/business.toml"))?;

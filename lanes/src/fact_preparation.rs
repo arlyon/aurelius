@@ -113,6 +113,8 @@ pub struct SpanCatalog {
     pub links: Vec<String>,
     spans: BTreeMap<String, crate::contracts::SourceSpan>,
     noun_refs: std::collections::BTreeSet<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_identity_refs: Option<std::collections::BTreeSet<String>>,
     action_refs: std::collections::BTreeSet<String>,
     clause_refs: std::collections::BTreeSet<String>,
     record_ref: Option<String>,
@@ -151,17 +153,16 @@ impl SpanCatalog {
         Ok(&self.resolve(href)?.quote)
     }
     pub fn anchor_hrefs(&self, kind: &crate::atomic::AnchorKind) -> Vec<String> {
-        match kind {
-            crate::atomic::AnchorKind::Mention => self.noun_refs.iter().cloned().collect(),
-            crate::atomic::AnchorKind::Action => self.action_refs.iter().cloned().collect(),
-            crate::atomic::AnchorKind::Facet => {
-                self.clause_refs.union(&self.noun_refs).cloned().collect()
-            }
-            crate::atomic::AnchorKind::Record => self.record_ref.iter().cloned().collect(),
+        if matches!(kind, crate::atomic::AnchorKind::Record) {
+            return self.record_ref.iter().cloned().collect();
+        }
+        match &self.source_identity_refs {
+            Some(identities) => identities.iter().cloned().collect(),
+            None => self.spans.keys().cloned().collect(),
         }
     }
-    /// File-only experiment: source boundaries are authoritative, linguistic tags are not.
-    /// Existing complete evidence units and the source-record anchor remain unchanged.
+    /// Identity eligibility is source-bound, never restricted by linguistic tags.
+    /// Preserve NLP retrieval hints, complete evidence units and the record anchor.
     pub fn relax_entity_anchors(&mut self, chunk: &crate::contracts::Chunk) -> Result<()> {
         ensure!(
             self.document == chunk.document.key
@@ -223,10 +224,7 @@ impl SpanCatalog {
             serde_json::to_vec(&self.links)?.len() <= 128 * 1024,
             "relaxed source links exceed bound"
         );
-        let allowed = self.spans.keys().cloned().collect();
-        self.noun_refs = allowed;
-        self.action_refs = self.noun_refs.clone();
-        self.clause_refs = self.noun_refs.clone();
+        self.source_identity_refs = Some(self.spans.keys().cloned().collect());
         Ok(())
     }
     pub fn record_anchor(&self) -> Result<&crate::contracts::SourceSpan> {
@@ -383,6 +381,7 @@ impl PreparedFactSource {
             links,
             spans,
             noun_refs,
+            source_identity_refs: None,
             action_refs,
             clause_refs,
             record_ref,
