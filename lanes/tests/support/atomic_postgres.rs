@@ -93,6 +93,82 @@ async fn exercise_open_claims(
     Ok(())
 }
 
+async fn exercise_atomic_runtime(
+    sink: &PostgresSink,
+    admin: &PgPool,
+    chunk: &Chunk,
+    prepared: &PreparedFactSource,
+) -> Result<()> {
+    let policy: aurelius_lanes::quality::QualityConfig = serde_json::from_value(json!({
+        "format":"atomic_spo_v3", "context_as_of":"2026-01-01T00:00:00Z", "max_output_tokens":2048
+    }))?;
+    let registry = policy.atomic_registry()?;
+    let base = "e".repeat(64);
+    let request = atomic::prepare_request(chunk, prepared, &registry, &base, 2048)?;
+    let start = chunk
+        .document
+        .text
+        .find("Monthly budget")
+        .context("budget")?;
+    let raw = json!({
+        "local_entities":[{"id":"plan","entity_type":"budget_plan","identity_span_ref":"span:0-6","action_kind":null}],
+        "assertions":[{"subject":{"ref":"plan"},"predicate":"monthly_budget",
+            "object":{"kind":"money","amount":"1500","currency_symbol":"$","period":"month"},
+            "qualification":{"mode":"required","polarity":"positive","conditions":[],"attribution":[],"validity":{"from":null,"to":null}},
+            "evidence":[format!("span:{start}-{}",chunk.document.text.len())]}],
+        "review_items":[]
+    }).to_string();
+    let mut extracted = AtomicExtraction {
+        graph: atomic::validate(&raw, &request.catalog, &registry)?,
+        raw_output: raw,
+        profile: request.profile.clone(),
+        binding: request.binding.clone(),
+        usage: None,
+    };
+    ensure!(extracted.graph.assertions.len() == 1);
+    let profile = policy.profile(&base, &prepared.preparation_profile)?;
+    ensure!(profile != request.profile);
+    let id = sink
+        .write_runtime_atomic_candidates(chunk, &extracted, prepared, &base, &policy)
+        .await?;
+    ensure!(
+        sink.write_runtime_atomic_candidates(chunk, &extracted, prepared, &base, &policy)
+            .await?
+            == id
+    );
+    ensure!(sink.candidate_exists(chunk, &profile).await?);
+    let metadata: Value =
+        sqlx::query_scalar("SELECT metadata FROM \"adapter-target\".\"source-docs\" WHERE id=$1")
+            .bind(&id)
+            .fetch_one(admin)
+            .await?;
+    ensure!(metadata["profile"] == profile && metadata["protocol_profile"] == request.profile);
+    ensure!(metadata["candidate_graph"]["contract_version"] == atomic::VERSION);
+    ensure!(
+        metadata["candidate_graph"]["assertions"][0]["assertion"]["object"]["amount"] == "1500"
+    );
+    ensure!(metadata["generation"] == extracted.raw_output);
+    let mut other = chunk.clone();
+    other.document.key.scope = "tenant-b".into();
+    ensure!(
+        sink.write_runtime_atomic_candidates(&other, &extracted, prepared, &base, &policy)
+            .await
+            .is_err()
+    );
+    ensure!(
+        sink.write_runtime_atomic_candidates(chunk, &extracted, prepared, &"f".repeat(64), &policy)
+            .await
+            .is_err()
+    );
+    extracted.graph.assertions[0].rendered.push_str(" tampered");
+    ensure!(
+        sink.write_runtime_atomic_candidates(chunk, &extracted, prepared, &base, &policy)
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
 pub async fn exercise(sink: &PostgresSink, admin: &PgPool, config_text: &str) -> Result<()> {
     let mut indexed = super::document("atomic-postgres");
     let text = "Report\nMonthly budget $1500/month.";
@@ -148,6 +224,7 @@ pub async fn exercise(sink: &PostgresSink, admin: &PgPool, config_text: &str) ->
         "b".repeat(64),
     )?;
     exercise_open_claims(sink, admin, &chunk, &prepared).await?;
+    exercise_atomic_runtime(sink, admin, &chunk, &prepared).await?;
     let registry = Registry {
         entity_anchors: BTreeMap::from([("report".into(), AnchorKind::Facet)]),
         predicates: BTreeMap::from([(

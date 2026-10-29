@@ -348,7 +348,32 @@ mod runtime {
                     continue;
                 }
                 let stored = async {
-                    if policy.format == crate::quality::ExtractionFormat::OpenClaimsV3 {
+                    if policy.format == crate::quality::ExtractionFormat::AtomicSpoV3 {
+                        let registry = policy.atomic_registry()?;
+                        let extracted = self
+                            .extractor
+                            .extract_atomic(
+                                &chunk,
+                                &prepared,
+                                &registry,
+                                policy.max_output_tokens.unwrap_or(4096),
+                            )
+                            .await?;
+                        self.sink
+                            .write_runtime_atomic_candidates(
+                                &chunk,
+                                &extracted,
+                                &prepared,
+                                &self.extractor.atomic_profile,
+                                policy,
+                            )
+                            .await?;
+                        Ok((
+                            extracted.graph.assertions.len(),
+                            !extracted.graph.review_items.is_empty()
+                                || !extracted.graph.unresolved_entity_ids.is_empty(),
+                        ))
+                    } else if policy.format == crate::quality::ExtractionFormat::OpenClaimsV3 {
                         let extracted = self
                             .extractor
                             .extract_open_claims(&chunk, &prepared, policy)

@@ -8,6 +8,81 @@ use aurelius_lanes::{
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+
+#[test]
+fn atomic_runtime_restores_the_preserved_registry_with_a_distinct_profile() -> Result<()> {
+    use aurelius_lanes::{
+        config::Config,
+        quality::{ExtractionFormat, QualityConfig},
+    };
+    let ontology = Config::parse(include_str!("fixtures/business.toml"))?.ontology;
+    let mut policy: QualityConfig = serde_json::from_value(json!({
+        "context_as_of":"2026-01-01T00:00:00Z", "max_output_tokens":4096
+    }))?;
+    let base = "c".repeat(64);
+    let preparation = "b".repeat(64);
+    let typed = policy.profile(&base, &preparation)?;
+    policy.format = ExtractionFormat::OpenClaimsV3;
+    let open = policy.profile(&base, &preparation)?;
+    policy.format = ExtractionFormat::AtomicSpoV3;
+    policy.validate(&ontology)?;
+    let runtime = policy.profile(&base, &preparation)?;
+    assert_ne!(runtime, typed);
+    assert_ne!(runtime, open);
+    assert_eq!(serde_json::to_value(&policy)?["format"], "atomic_spo_v3");
+    let registry = policy.atomic_registry()?;
+    let preserved: Registry = serde_json::from_str(include_str!("../examples/atomic_spo.json"))?;
+    assert_eq!(
+        registry.semantic_definition()?,
+        preserved.semantic_definition()?
+    );
+    assert_eq!(
+        registry.rendering_profile()?,
+        preserved.rendering_profile()?
+    );
+    for predicate in [
+        "monthly_budget",
+        "pull_deadline",
+        "executor",
+        "recipient",
+        "target",
+        "access_level",
+    ] {
+        assert!(registry.predicates.contains_key(predicate));
+    }
+    policy.max_output_tokens = Some(2048);
+    assert_ne!(runtime, policy.profile(&base, &preparation)?);
+    assert_ne!(runtime, policy.profile(&"d".repeat(64), &preparation)?);
+    assert_ne!(runtime, policy.profile(&base, &"a".repeat(64))?);
+    policy.align_mentions = true;
+    assert!(policy.validate(&ontology).is_err());
+    policy.align_mentions = false;
+    policy.extra_instructions = Some("Do not silently change the atomic prompt".into());
+    assert!(policy.validate(&ontology).is_err());
+    Ok(())
+}
+
+#[test]
+fn atomic_runtime_refuses_legacy_chat_api_instead_of_falling_back() -> Result<()> {
+    use aurelius_lanes::config::Config;
+    let mut config = Config::parse(include_str!("fixtures/business.toml"))?;
+    config.chat = Some(serde_json::from_value(json!({
+        "endpoint":"http://127.0.0.1:1234/v1/chat/completions", "model":"fixture",
+        "revision":"fixture", "api":"chat_completions"
+    }))?);
+    config.fact_quality = Some(serde_json::from_value(json!({
+        "format":"atomic_spo_v3", "context_as_of":"2026-01-01T00:00:00Z"
+    }))?);
+    assert!(
+        config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("Responses API")
+    );
+    Ok(())
+}
+
 #[test]
 fn relaxed_identity_spans_do_not_depend_on_noun_or_verb_tags() -> Result<()> {
     let (mut chunk, mut prepared, _) = fixture()?;

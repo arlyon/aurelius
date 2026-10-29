@@ -309,7 +309,7 @@ pub struct ChatExtractor {
     model: String,
     ontology: Ontology,
     pub profile: String,
-    atomic_profile: String,
+    pub(crate) atomic_profile: String,
     ontology_hash: String,
     prompt: String,
     api: ChatApi,
@@ -533,7 +533,8 @@ impl ChatExtractor {
             registry,
             &self.atomic_profile,
             max_output_tokens,
-        )?;
+        )
+        .context(ExtractionReview::Input)?;
         let format = json!({"type":"json_schema","name":crate::atomic::FORMAT_NAME,"strict":true,"schema":request.schema});
         let output = self
             .complete_formatted(
@@ -544,8 +545,8 @@ impl ChatExtractor {
                 Some(&format),
             )
             .await?;
-        let graph =
-            crate::atomic::validate(&output.text, &request.catalog, registry).map_err(|error| {
+        let graph = crate::atomic::validate(&output.text, &request.catalog, registry)
+            .map_err(|error| {
                 with_usage(
                     self.with_output(
                         error.context(ReviewDiagnostic::NativeSchemaViolation),
@@ -553,7 +554,8 @@ impl ChatExtractor {
                     ),
                     output.usage.as_ref(),
                 )
-            })?;
+            })
+            .context(ExtractionReview::Output)?;
         Ok(AtomicExtraction {
             graph,
             usage: output.usage,

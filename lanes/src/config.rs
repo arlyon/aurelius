@@ -146,7 +146,14 @@ impl Config {
     }
     pub fn extraction_profile(&self) -> Result<String> {
         let chat = self.chat.as_ref().context("chat configuration required")?;
-        let base = crate::facts::ChatExtractor::profile_for(chat, &self.ontology)?;
+        let base =
+            if self.fact_quality.as_ref().is_some_and(|policy| {
+                policy.format == crate::quality::ExtractionFormat::AtomicSpoV3
+            }) {
+                crate::facts::ChatExtractor::atomic_profile_for(chat, &self.ontology)?
+            } else {
+                crate::facts::ChatExtractor::profile_for(chat, &self.ontology)?
+            };
         if let Some(policy) = &self.fact_quality {
             #[cfg(feature = "language")]
             return policy.profile(
@@ -203,12 +210,16 @@ impl Config {
         }
         if let Some(quality) = &self.fact_quality {
             quality.validate(&self.ontology)?;
-            if quality.format == crate::quality::ExtractionFormat::OpenClaimsV3 {
+            if matches!(
+                quality.format,
+                crate::quality::ExtractionFormat::OpenClaimsV3
+                    | crate::quality::ExtractionFormat::AtomicSpoV3
+            ) {
                 ensure!(
                     self.chat
                         .as_ref()
                         .is_some_and(|chat| matches!(chat.api, ChatApi::Responses)),
-                    "open claims require the native Responses API"
+                    "native fact extraction requires the Responses API"
                 );
             }
             ensure!(

@@ -836,6 +836,43 @@ mod driver {
             registry: &crate::atomic::Registry,
             extracted: &crate::facts::AtomicExtraction,
         ) -> Result<String> {
+            self.write_atomic_candidates_with_profile(chunk, request, registry, extracted, None)
+                .await
+        }
+        pub async fn write_runtime_atomic_candidates(
+            &self,
+            chunk: &crate::contracts::Chunk,
+            extracted: &crate::facts::AtomicExtraction,
+            prepared: &crate::fact_preparation::PreparedFactSource,
+            base_profile: &str,
+            policy: &crate::quality::QualityConfig,
+        ) -> Result<String> {
+            let registry = policy.atomic_registry()?;
+            let request = crate::atomic::prepare_request(
+                chunk,
+                prepared,
+                &registry,
+                base_profile,
+                policy.max_output_tokens.unwrap_or(4096),
+            )?;
+            let profile = policy.profile(base_profile, &prepared.preparation_profile)?;
+            self.write_atomic_candidates_with_profile(
+                chunk,
+                &request,
+                &registry,
+                extracted,
+                Some(&profile),
+            )
+            .await
+        }
+        async fn write_atomic_candidates_with_profile(
+            &self,
+            chunk: &crate::contracts::Chunk,
+            request: &crate::atomic::PreparedRequest,
+            registry: &crate::atomic::Registry,
+            extracted: &crate::facts::AtomicExtraction,
+            runtime_profile: Option<&str>,
+        ) -> Result<String> {
             chunk.text()?;
             ensure!(
                 request.binding == extracted.binding && request.profile == extracted.profile,
@@ -871,8 +908,12 @@ mod driver {
                     local(span)?;
                 }
             }
-            let metadata = json!({"status":"candidate","profile":request.profile,"source_artifact_id":chunk.document.key.source,"source_revision":chunk.document.key.revision,"source_range":chunk.range,"source_content_hash":graph.content_hash,"candidate_graph":graph,"request_binding":request.binding,"generation":extracted.raw_output,"usage":extracted.usage,"chunk_count":0});
-            self.write_candidate_artifact(chunk, &request.profile, metadata)
+            let profile = runtime_profile.unwrap_or(&request.profile);
+            let mut metadata = json!({"status":"candidate","profile":profile,"source_artifact_id":chunk.document.key.source,"source_revision":chunk.document.key.revision,"source_range":chunk.range,"source_content_hash":graph.content_hash,"candidate_graph":graph,"request_binding":request.binding,"generation":extracted.raw_output,"usage":extracted.usage,"chunk_count":0});
+            if runtime_profile.is_some() {
+                metadata["protocol_profile"] = json!(request.profile);
+            }
+            self.write_candidate_artifact(chunk, profile, metadata)
                 .await
         }
         pub async fn write_provider_properties(

@@ -36,6 +36,7 @@ pub enum ExtractionFormat {
     #[default]
     Typed,
     OpenClaimsV3,
+    AtomicSpoV3,
 }
 impl ExtractionFormat {
     fn is_typed(&self) -> bool {
@@ -85,7 +86,10 @@ fn name(value: &str) -> bool {
 impl QualityConfig {
     pub fn validate(&self, ontology: &Ontology) -> Result<()> {
         ontology.validate()?;
-        if self.format == ExtractionFormat::OpenClaimsV3 {
+        if matches!(
+            self.format,
+            ExtractionFormat::OpenClaimsV3 | ExtractionFormat::AtomicSpoV3
+        ) {
             ensure!(
                 self.properties.is_empty()
                     && self.extra_instructions.is_none()
@@ -94,8 +98,11 @@ impl QualityConfig {
                     && !self.align_mentions
                     && self.metadata_relations == provider_relations()
                     && self.scope_review_relations == scope_review_relations(),
-                "open claims cannot mix typed vocabulary, custom prompts or quote repair policies"
+                "native extraction cannot mix vocabulary, custom prompts or quote repair policies"
             );
+        }
+        if self.format == ExtractionFormat::AtomicSpoV3 {
+            self.atomic_registry()?;
         }
         if let Some(limit) = self.max_output_tokens {
             ensure!(
@@ -142,7 +149,33 @@ impl QualityConfig {
         );
         Ok(())
     }
+    pub fn atomic_registry(&self) -> Result<crate::atomic::Registry> {
+        ensure!(
+            self.format == ExtractionFormat::AtomicSpoV3,
+            "atomic runtime policy required"
+        );
+        let registry: crate::atomic::Registry =
+            serde_json::from_str(include_str!("../examples/atomic_spo.json"))?;
+        registry.validate()?;
+        Ok(registry)
+    }
     pub fn profile(&self, base: &str, preparation: &str) -> Result<String> {
+        if self.format == ExtractionFormat::AtomicSpoV3 {
+            let registry = self.atomic_registry()?;
+            return Ok(blake3::hash(&serde_json::to_vec(&(
+                "atomic-spo-runtime-v1",
+                crate::atomic::VERSION,
+                crate::atomic::EXTRACTOR_VERSION,
+                crate::atomic::PROMPT,
+                base,
+                preparation,
+                registry.semantic_definition()?,
+                registry.rendering_profile()?,
+                self,
+            ))?)
+            .to_hex()
+            .to_string());
+        }
         if self.format == ExtractionFormat::OpenClaimsV3 {
             return Ok(blake3::hash(&serde_json::to_vec(&(
                 "open-claims-runtime-v1",
